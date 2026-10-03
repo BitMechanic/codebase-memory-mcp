@@ -357,7 +357,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
 
 /* Languages whose methods are defined out of line, away from the class. */
 static bool path_is_c_family(const char *path) {
-    static const char *const exts[] = {"cpp", "cc",  "cxx", "c++", "hpp", "hh", "hxx",
+    static const char *const exts[] = {"cpp", "cc",  "cxx", "c++", "hpp", "hh",  "hxx",
                                        "h",   "inl", "ipp", "tpp", "cu",  "cuh", NULL};
     const char *dot = path ? strrchr(path, '.') : NULL;
     if (!dot) {
@@ -527,16 +527,57 @@ static bool file_visible_to_caller(const cbm_gbuf_t *gbuf, const char *file,
     return false;
 }
 
+/* A method can be called wherever its class is declared. The class node that
+ * owns the method is one declaration; a class of the same name in a file the
+ * caller can see may be another declaration of the same class: the caller's
+ * own redeclaration, or the header copy of a class whose members are defined
+ * inline in a source file. It may equally be an unrelated class that happens
+ * to share the name (test files reuse names such as FFixture), so the name is
+ * accepted only when `by_name` says the method itself is the only one of its
+ * name in the project. */
+static bool owner_type_visible(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *owner,
+                               const char *caller_file, const char **import_vals, int import_count,
+                               bool by_name) {
+    if (file_visible_to_caller(gbuf, owner->file_path, caller_file, import_vals, import_count)) {
+        return true;
+    }
+    if (!by_name) {
+        return false;
+    }
+    const cbm_gbuf_node_t **same = NULL;
+    int same_count = 0;
+    if (!owner->name || cbm_gbuf_find_by_name(gbuf, owner->name, &same, &same_count) != 0) {
+        return false;
+    }
+    for (int i = 0; i < same_count; i++) {
+        if (same[i] != owner && label_can_own_methods(same[i]->label) &&
+            file_visible_to_caller(gbuf, same[i]->file_path, caller_file, import_vals,
+                                   import_count)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* C and C++: a translation unit can only call what it can see. A call the
  * registry matched by name alone (suffix_match / unique_name / field_type_hint)
  * is therefore kept only when the target is declared in the caller's own file,
  * its same-name header or source, or a file it includes directly — where a
- * method is declared by the file of its owning type. A member call matched by
+ * method is declared by any file that declares its class. A member call matched by
  * name among several candidates is dropped outright: with the receiver's type
  * unknown, `Items.Add(x)` on a library container would bind to whichever
  * project function happens to be called Add. Type-resolved calls (lsp_*) and
- * the import- or scope-aware strategies are never touched. */
-bool cbm_suppress_c_family_weak_call(CBMLanguage caller_lang, bool is_method, const char *strategy,
+ * the import- or scope-aware strategies are never touched.
+ *
+ * One exception. A free function can be declared by a prototype anywhere: in
+ * the caller's own file, or in a header named differently from the source that
+ * defines it. Prototypes are not in the graph, so the test above cannot see
+ * them and would drop a real call. A bare call that matched the project's only
+ * free function of that name therefore stands: with one candidate the name is
+ * the evidence. A method needs no such exception, because its declaration is
+ * its class, and the class's file is what the test checks. */
+bool cbm_suppress_c_family_weak_call(CBMLanguage caller_lang, bool is_method,
+                                     const char *callee_name, const char *strategy,
                                      const char *caller_file, const cbm_gbuf_t *gbuf,
                                      const cbm_gbuf_node_t *target, const char **import_vals,
                                      int import_count) {
@@ -546,6 +587,16 @@ bool cbm_suppress_c_family_weak_call(CBMLanguage caller_lang, bool is_method, co
     }
     if (is_method && strcmp(strategy, "unique_name") != 0) {
         return true;
+    }
+    /* The free-function exception is for a call with no receiver at all. The
+     * extractor flags a member call only when the receiver is a plain
+     * identifier, so `(A - B).Equals(C)` arrives unflagged; the callee text
+     * settles it. A scope (`Ns::Fn`) is not a receiver. */
+    const bool has_receiver =
+        is_method || (callee_name && (strchr(callee_name, '.') || strstr(callee_name, "->")));
+    if (!has_receiver && strcmp(strategy, "unique_name") == 0 && target->label &&
+        strcmp(target->label, "Function") == 0) {
+        return false;
     }
     if (!caller_file || !target->file_path) {
         return false;
@@ -559,8 +610,8 @@ bool cbm_suppress_c_family_weak_call(CBMLanguage caller_lang, bool is_method, co
                                            &owner_count) == 0 &&
         owner_count > 0) {
         const cbm_gbuf_node_t *owner = cbm_gbuf_find_by_id(gbuf, owners[0]->source_id);
-        if (owner && file_visible_to_caller(gbuf, owner->file_path, caller_file, import_vals,
-                                            import_count)) {
+        if (owner && owner_type_visible(gbuf, owner, caller_file, import_vals, import_count,
+                                        strcmp(strategy, "unique_name") == 0)) {
             return false;
         }
     }
