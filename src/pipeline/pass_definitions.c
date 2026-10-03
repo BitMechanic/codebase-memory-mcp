@@ -353,6 +353,155 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     }
 }
 
+/* ── Cross-file method → class linking (C/C++) ───────────────────── */
+
+/* Languages whose methods are defined out of line, away from the class. */
+static bool path_is_c_family(const char *path) {
+    static const char *const exts[] = {"cpp", "cc",  "cxx", "c++", "hpp", "hh", "hxx",
+                                       "h",   "inl", "ipp", "tpp", "cu",  "cuh", NULL};
+    const char *dot = path ? strrchr(path, '.') : NULL;
+    if (!dot) {
+        return false;
+    }
+    for (int i = 0; exts[i]; i++) {
+        const char *a = dot + SKIP_ONE;
+        const char *b = exts[i];
+        while (*a && *b && tolower((unsigned char)*a) == *b) {
+            a++;
+            b++;
+        }
+        if (!*a && !*b) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool label_can_own_methods(const char *label) {
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Struct") == 0 ||
+                     strcmp(label, "Interface") == 0 || strcmp(label, "Union") == 0);
+}
+
+/* File name without its directories and extension, as a span of `path`. */
+static size_t file_stem(const char *path, const char **start) {
+    const char *base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + SKIP_ONE;
+        }
+    }
+    const char *dot = strrchr(base, '.');
+    *start = base;
+    return dot ? (size_t)(dot - base) : strlen(base);
+}
+
+static bool same_file_stem(const char *a, const char *b) {
+    if (!a || !b) {
+        return false;
+    }
+    const char *sa = NULL;
+    const char *sb = NULL;
+    size_t la = file_stem(a, &sa);
+    size_t lb = file_stem(b, &sb);
+    return la == lb && strncmp(sa, sb, la) == 0;
+}
+
+/* Copy the string value of `key` out of a node's properties JSON. */
+static bool prop_string(const char *json, const char *key, char *buf, size_t size) {
+    char needle[CBM_SZ_64];
+    if (!json || snprintf(needle, sizeof(needle), "\"%s\":\"", key) >= (int)sizeof(needle)) {
+        return false;
+    }
+    const char *start = strstr(json, needle);
+    if (!start) {
+        return false;
+    }
+    start += strlen(needle);
+    const char *end = strchr(start, '"');
+    if (!end || (size_t)(end - start) >= size) {
+        return false;
+    }
+    memcpy(buf, start, (size_t)(end - start));
+    buf[end - start] = '\0';
+    return true;
+}
+
+/* C and C++ define a class's methods out of line, usually in another file and —
+ * with a Public/Private source layout — in another directory. The extractor
+ * derives the parent class QN from the method's own file, so the QN lookup in
+ * process_def / register_and_link_def misses the class and the method is left
+ * without a DEFINES_METHOD edge. Once every definition is registered, link each
+ * such method to the type of that name: the only one in the project, or else
+ * the only one with a body (the others being forward declarations), or else the
+ * one whose file has the same base name as the method's file. A name that is
+ * still ambiguous is left unlinked. Returns the number of edges added. */
+int cbm_pipeline_link_cross_file_methods(cbm_pipeline_ctx_t *ctx) {
+    const cbm_gbuf_node_t **methods = NULL;
+    int method_count = 0;
+    if (cbm_gbuf_find_by_label(ctx->gbuf, "Method", &methods, &method_count) != 0) {
+        return 0;
+    }
+    int linked = 0;
+    for (int i = 0; i < method_count; i++) {
+        const cbm_gbuf_node_t *method = methods[i];
+        if (!path_is_c_family(method->file_path)) {
+            continue;
+        }
+        const cbm_gbuf_edge_t **owners = NULL;
+        int owner_count = 0;
+        if (cbm_gbuf_find_edges_by_target_type(ctx->gbuf, method->id, "DEFINES_METHOD", &owners,
+                                               &owner_count) != 0 ||
+            owner_count > 0) {
+            continue;
+        }
+        char parent_qn[CBM_SZ_512];
+        if (!prop_string(method->properties_json, "parent_class", parent_qn, sizeof(parent_qn))) {
+            continue;
+        }
+        const char *dot = strrchr(parent_qn, '.');
+        const char *class_name = dot ? dot + SKIP_ONE : parent_qn;
+        const cbm_gbuf_node_t **hits = NULL;
+        int hit_count = 0;
+        if (!class_name[0] ||
+            cbm_gbuf_find_by_name(ctx->gbuf, class_name, &hits, &hit_count) != 0) {
+            continue;
+        }
+        const cbm_gbuf_node_t *only = NULL;
+        const cbm_gbuf_node_t *with_body = NULL;
+        const cbm_gbuf_node_t *sibling = NULL;
+        int named = 0;
+        int with_bodies = 0;
+        int siblings = 0;
+        for (int h = 0; h < hit_count; h++) {
+            if (!label_can_own_methods(hits[h]->label)) {
+                continue;
+            }
+            named++;
+            only = hits[h];
+            /* A forward declaration (`class Foo;`) is a one-line node of the
+             * same name; the definition spans its body. */
+            if (hits[h]->end_line > hits[h]->start_line) {
+                with_bodies++;
+                with_body = hits[h];
+            }
+            if (same_file_stem(hits[h]->file_path, method->file_path)) {
+                siblings++;
+                sibling = hits[h];
+            }
+        }
+        const cbm_gbuf_node_t *owner = named == 1         ? only
+                                       : with_bodies == 1 ? with_body
+                                       : siblings == 1    ? sibling
+                                                          : NULL;
+        if (owner) {
+            cbm_gbuf_insert_edge(ctx->gbuf, owner->id, method->id, "DEFINES_METHOD", "{}");
+            linked++;
+        }
+    }
+    cbm_log_info("pass.done", "pass", "cross_file_methods", "linked", itoa_log(linked));
+    return linked;
+}
+
 /* Create Channel nodes + EMITS / LISTENS_ON edges for one file's channels.
  * Mirrors the parallel path in cbm_build_registry_from_cache — keep in sync. */
 /* Find the source node for a channel edge: enclosing function or file node. */
@@ -923,6 +1072,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             free(local_cache);
         }
     }
+
+    cbm_pipeline_link_cross_file_methods(ctx);
 
     cbm_log_info("pass.done", "pass", "definitions", "defs", itoa_log(total_defs), "calls",
                  itoa_log(total_calls), "imports", itoa_log(total_imports), "errors",

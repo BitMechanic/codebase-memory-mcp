@@ -1842,6 +1842,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
     cbm_pipeline_namespace_map_free(namespace_map);
 
+    cbm_pipeline_link_cross_file_methods(ctx);
+
     cbm_log_info("parallel.registry.done", "entries", itoa_log(reg_entries), "defines",
                  itoa_log(defines_edges), "imports", itoa_log(imports_edges));
     return 0;

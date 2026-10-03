@@ -653,6 +653,10 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb);
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count);
 
+/* Link C/C++ methods defined out of line to their class when the class lives in
+ * another file (pass_definitions.c). Call once every definition is registered. */
+int cbm_pipeline_link_cross_file_methods(cbm_pipeline_ctx_t *ctx);
+
 int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 
 int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
