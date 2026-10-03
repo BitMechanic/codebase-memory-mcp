@@ -2756,6 +2756,25 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                             }
                                         }
                                     }
+                                    /* The raw pass can also have minted a free
+                                     * Function for an inline method of the
+                                     * misparsed class: same name, same lines, but a
+                                     * file-level QN, so the same-QN check above does
+                                     * not see it. The adopted Method replaces it;
+                                     * keeping both stores the method twice. */
+                                    if (macro_rescue && superseded && d->name && d->label &&
+                                        strcmp(d->label, "Method") == 0) {
+                                        for (int j = 0; j < defs_before; j++) {
+                                            CBMDefinition *r = &result->defs.items[j];
+                                            if (!superseded[j] && r->name && r->label &&
+                                                strcmp(r->label, "Function") == 0 &&
+                                                r->start_line == d->start_line &&
+                                                r->end_line == d->end_line &&
+                                                strcmp(r->name, d->name) == 0) {
+                                                superseded[j] = 1;
+                                            }
+                                        }
+                                    }
                                     if (rescued_count < 64) {
                                         rescued_spans[rescued_count].start = d->start_line;
                                         rescued_spans[rescued_count].end = d->end_line;
