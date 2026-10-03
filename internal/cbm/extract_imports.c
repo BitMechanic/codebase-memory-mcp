@@ -663,10 +663,45 @@ static char *strip_angle_brackets(CBMArena *a, char *path) {
     return path;
 }
 
-static void parse_c_imports(CBMExtractCtx *ctx) {
+static void push_c_include(CBMExtractCtx *ctx, TSNode node) {
     CBMArena *a = ctx->arena;
 
-    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    TSNode path_node = find_include_path_node(node);
+    if (ts_node_is_null(path_node)) {
+        return;
+    }
+
+    char *path = strip_quotes(a, cbm_node_text(a, path_node, ctx->source));
+    path = strip_angle_brackets(a, path);
+    if (!path || !path[0]) {
+        return;
+    }
+    // "Dir\File.h" names the same file as "Dir/File.h" to every compiler that accepts it.
+    for (char *c = path; *c; c++) {
+        if (*c == '\\') {
+            *c = '/';
+        }
+    }
+
+    CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+    cbm_imports_push(&ctx->result->imports, a, imp);
+}
+
+// File-scope constructs that can hold further #include lines: conditional
+// blocks, extern "C" { } and namespace bodies.
+static bool c_include_container(const char *kind) {
+    return strcmp(kind, "preproc_if") == 0 || strcmp(kind, "preproc_ifdef") == 0 ||
+           strcmp(kind, "preproc_else") == 0 || strcmp(kind, "preproc_elif") == 0 ||
+           strcmp(kind, "preproc_elifdef") == 0 || strcmp(kind, "linkage_specification") == 0 ||
+           strcmp(kind, "namespace_definition") == 0 || strcmp(kind, "declaration_list") == 0;
+}
+
+// Includes directly under `parent` and inside the containers above. A file
+// wrapped in one `#if` (a test file, a platform file) keeps every include one
+// level down, so reading only the root's children finds none of them.
+static void collect_c_includes(CBMExtractCtx *ctx, TSNode parent, int depth) {
+    enum { C_INCLUDE_MAX_DEPTH = 32 };
+    TSTreeCursor cursor = ts_tree_cursor_new(parent);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
         return;
@@ -674,25 +709,17 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
-        if (strcmp(kind, "preproc_include") != 0 && strcmp(kind, "preproc_import") != 0) {
-            continue;
+        if (strcmp(kind, "preproc_include") == 0 || strcmp(kind, "preproc_import") == 0) {
+            push_c_include(ctx, node);
+        } else if (depth < C_INCLUDE_MAX_DEPTH && c_include_container(kind)) {
+            collect_c_includes(ctx, node, depth + 1);
         }
-
-        TSNode path_node = find_include_path_node(node);
-        if (ts_node_is_null(path_node)) {
-            continue;
-        }
-
-        char *path = strip_quotes(a, cbm_node_text(a, path_node, ctx->source));
-        path = strip_angle_brackets(a, path);
-        if (!path || !path[0]) {
-            continue;
-        }
-
-        CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-        cbm_imports_push(&ctx->result->imports, a, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+}
+
+static void parse_c_imports(CBMExtractCtx *ctx) {
+    collect_c_includes(ctx, ctx->root, 0);
 }
 
 // --- Ruby imports ---

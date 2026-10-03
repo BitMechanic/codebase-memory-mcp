@@ -46,6 +46,7 @@ static const ext_entry_t EXT_TABLE[] = {
     {".hh", CBM_LANG_CPP},
     {".hpp", CBM_LANG_CPP},
     {".hxx", CBM_LANG_CPP},
+    {".inl", CBM_LANG_CPP},
     {".ixx", CBM_LANG_CPP},
 
     /* C# */

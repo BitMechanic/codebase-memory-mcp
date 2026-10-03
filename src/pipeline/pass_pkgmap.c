@@ -1799,8 +1799,8 @@ static bool is_c_family_source(const char *source_rel) {
     if (!source_rel || !source_rel[0]) {
         return false;
     }
-    static const char *exts[] = {".c", ".cc", ".cpp", ".cxx", ".c++",
-                                 ".h", ".hh", ".hpp", ".hxx", NULL};
+    static const char *exts[] = {".c",  ".cc",  ".cpp", ".cxx", ".c++", ".h",
+                                 ".hh", ".hpp", ".hxx", ".inl", NULL};
     for (const char **ext = exts; *ext; ext++) {
         size_t path_len = strlen(source_rel);
         size_t ext_len = strlen(*ext);
