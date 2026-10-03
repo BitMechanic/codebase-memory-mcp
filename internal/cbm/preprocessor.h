@@ -30,6 +30,12 @@ typedef struct {
 int cbm_export_macro_candidates(const char *source, int source_len,
                                 char (*out)[CBM_EXPORT_MACRO_NAME_MAX], int max_out);
 
+// Number of distinct Unreal Engine reflection markers (UCLASS, USTRUCT, UENUM,
+// UINTERFACE, UPROPERTY, UFUNCTION, UDELEGATE, UMETA, UPARAM, GENERATED_*BODY)
+// invoked in the source. The preprocessed second pass predefines each of them
+// as an empty function-like macro so the declarations around them parse.
+int cbm_unreal_reflection_macro_count(const char *source, int source_len);
+
 // Preprocess C/C++ source: expand macros, evaluate #ifdef, resolve #include.
 // Returns malloc-allocated expanded source, or NULL if no expansion needed/on failure.
 // extra_defines: NULL-terminated array of "NAME=VALUE" strings (can be NULL).

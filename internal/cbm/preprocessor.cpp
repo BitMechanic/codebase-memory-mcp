@@ -319,6 +319,106 @@ int cbm_export_macro_candidates(const char *source, int source_len,
     return collect_export_macro_candidates(source, source_len, out, max_out);
 }
 
+// ── Unreal Engine reflection markers ─────────────────────────────────
+// UCLASS(...), UPROPERTY(...), GENERATED_BODY() and their relatives are
+// function-like macros read by the Unreal Header Tool. To the compiler they
+// are (nearly) nothing, but tree-sitter sees an unknown call in declaration
+// position, and the enclosing type or member falls into an ERROR region. The
+// preprocessed second pass predefines the ones a file invokes as empty
+// function-like macros. Unlike export macros the names are fixed, so this is a
+// table rather than a shape rule.
+static const char *kUnrealReflectionMacros[] = {"UCLASS",
+                                                "USTRUCT",
+                                                "UENUM",
+                                                "UINTERFACE",
+                                                "UPROPERTY",
+                                                "UFUNCTION",
+                                                "UDELEGATE",
+                                                "UMETA",
+                                                "UPARAM",
+                                                "GENERATED_BODY",
+                                                "GENERATED_BODY_LEGACY",
+                                                "GENERATED_UCLASS_BODY",
+                                                "GENERATED_USTRUCT_BODY",
+                                                "GENERATED_UINTERFACE_BODY",
+                                                "GENERATED_IINTERFACE_BODY",
+                                                NULL};
+
+// Bit i is set when kUnrealReflectionMacros[i] is invoked in code: the name
+// followed by '(' outside comments and string literals. An unrecognizable raw
+// string poisons the scan, as it does for export macros, and yields 0 so the
+// second pass is not triggered on its account.
+static uint32_t unreal_reflection_macros_used(const char *source, int source_len) {
+    uint32_t used = 0;
+    if (!source || source_len <= 0) {
+        return 0;
+    }
+    int i = 0;
+    while (i < source_len) {
+        i = skip_non_code(source, source_len, i);
+        if (i >= source_len) {
+            break;
+        }
+        if (!is_identifier_start(source[i])) {
+            i++;
+            continue;
+        }
+        int start = i;
+        while (i < source_len && is_identifier_char(source[i])) {
+            i++;
+        }
+        int raw = raw_string_after_prefix(source, source_len, start, i);
+        if (raw < 0) {
+            return 0;
+        }
+        if (raw > 0) {
+            i = raw;
+            continue;
+        }
+        // Every name in the table starts with 'U' or 'G'.
+        if (source[start] != 'U' && source[start] != 'G') {
+            continue;
+        }
+        int next = i;
+        while (next < source_len && (source[next] == ' ' || source[next] == '\t')) {
+            next++;
+        }
+        if (next >= source_len || source[next] != '(') {
+            continue;
+        }
+        size_t len = (size_t)(i - start);
+        for (int k = 0; kUnrealReflectionMacros[k]; k++) {
+            if (strlen(kUnrealReflectionMacros[k]) == len &&
+                strncmp(source + start, kUnrealReflectionMacros[k], len) == 0) {
+                used |= (1u << k);
+                break;
+            }
+        }
+    }
+    return used;
+}
+
+int cbm_unreal_reflection_macro_count(const char *source, int source_len) {
+    uint32_t used = unreal_reflection_macros_used(source, source_len);
+    int count = 0;
+    for (; used; used >>= 1) {
+        count += (int)(used & 1u);
+    }
+    return count;
+}
+
+// True when `defines` already holds a definition of `name`, object-like
+// ("NAME=...") or function-like ("NAME(...)=...").
+static bool define_is_provided(const std::list<std::string> &defines, const char *name) {
+    for (std::list<std::string>::const_iterator it = defines.begin(); it != defines.end(); ++it) {
+        const std::string &def = *it;
+        if (def.substr(0, def.find_first_of("=(")) == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int count_expanded_lines(const std::string &text) {
     int count = 1;
     for (char c : text) {
@@ -425,9 +525,11 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
                                                const char **include_paths, int cpp_mode) {
     // Run the second pass when there are directives to evaluate OR when the file
     // carries export-macro-shaped identifiers to predefine empty (#1989) — a UE
-    // plugin header with only `#pragma once` + `#include` lines still needs it.
+    // plugin header with only `#pragma once` + `#include` lines still needs it —
+    // OR when it invokes Unreal reflection markers.
+    const uint32_t unreal_used = unreal_reflection_macros_used(source, source_len);
     if (!has_preprocessor_work(source, source_len) &&
-        !has_export_macro_candidates(source, source_len)) {
+        !has_export_macro_candidates(source, source_len) && unreal_used == 0) {
         return NULL; // NULL = no expansion needed, use original
     }
 
@@ -444,19 +546,16 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
         int export_cand_count =
             collect_export_macro_candidates(source, source_len, export_cands, CBM_EXPORT_MACRO_MAX);
         for (int i = 0; i < export_cand_count; i++) {
-            bool provided = false;
-            for (std::list<std::string>::const_iterator it = dui.defines.begin();
-                 it != dui.defines.end(); ++it) {
-                const std::string &def = *it;
-                size_t eq = def.find('=');
-                std::string name = (eq == std::string::npos) ? def : def.substr(0, eq);
-                if (name == export_cands[i]) {
-                    provided = true;
-                    break;
-                }
-            }
-            if (!provided) {
+            if (!define_is_provided(dui.defines, export_cands[i])) {
                 dui.defines.push_back(std::string(export_cands[i]) + "=");
+            }
+        }
+        // Predefine the Unreal reflection markers this file invokes as empty
+        // function-like macros. The same rule applies: a caller's define wins.
+        for (int i = 0; kUnrealReflectionMacros[i]; i++) {
+            if ((unreal_used & (1u << i)) &&
+                !define_is_provided(dui.defines, kUnrealReflectionMacros[i])) {
+                dui.defines.push_back(std::string(kUnrealReflectionMacros[i]) + "(...)=");
             }
         }
         if (include_paths) {

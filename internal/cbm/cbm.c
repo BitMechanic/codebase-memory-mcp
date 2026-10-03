@@ -2445,6 +2445,11 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         char export_cands[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
         int export_cand_count =
             cbm_export_macro_candidates(source, source_len, export_cands, CBM_EXPORT_MACRO_MAX);
+        /* Unreal reflection markers (UCLASS(...), UPROPERTY(...), GENERATED_BODY(),
+         * ...) are predefined empty in the expanded buffer as well. A file that
+         * uses either kind gets the same def-rescue rules below. */
+        const bool macro_rescue =
+            export_cand_count > 0 || cbm_unreal_reflection_macro_count(source, source_len) > 0;
         CBMPreprocessedSource *preprocessed = cbm_preprocess_with_map(
             source, source_len, rel_path, extra_defines, include_paths, language != CBM_LANG_C);
         if (preprocessed && preprocessed->source) {
@@ -2550,7 +2555,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                             cbm_extract_definitions(&pp_ctx);
                             int w = defs_before;
                             char *superseded = NULL;
-                            if (export_cand_count > 0 && defs_before > 0) {
+                            if (macro_rescue && defs_before > 0) {
                                 superseded =
                                     (char *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)defs_before);
                             }
@@ -2578,7 +2583,31 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                             adopt = true;
                                         }
                                     }
-                                    if (!adopt && export_cand_count > 0 && d->name) {
+                                    /* An error-region adoption can also be the
+                                     * correction of a raw misparse artifact:
+                                     * `class MOD_API Foo : public Base {...}` with
+                                     * inline method bodies leaves a raw
+                                     * Function/Variable def named Foo AND an ERROR
+                                     * region inside the class. Name that artifact
+                                     * here, or the same-QN check below rejects the
+                                     * corrected type def: the artifact's span is
+                                     * shorter, so the identical-span exemption does
+                                     * not cover it. */
+                                    if (adopt && macro_rescue && d->name && d->label &&
+                                        cbm_def_label_is_type(d->label)) {
+                                        for (int j = 0; j < defs_before; j++) {
+                                            CBMDefinition *r = &result->defs.items[j];
+                                            if (r->name && r->label &&
+                                                strcmp(r->name, d->name) == 0 &&
+                                                !cbm_def_label_is_type(r->label) &&
+                                                r->start_line <= d->end_line &&
+                                                d->start_line <= r->end_line) {
+                                                supersede_j = j;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (!adopt && macro_rescue && d->name) {
                                         for (int ci = 0; ci < export_cand_count && !adopt; ci++) {
                                             for (int j = 0; j < defs_before && !adopt; j++) {
                                                 CBMDefinition *r = &result->defs.items[j];
@@ -2701,6 +2730,26 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                             }
                                             for (const char **b = d->base_classes; *b; b++) {
                                                 if (strcmp(*b, r->name) == 0) {
+                                                    superseded[j] = 1;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    /* A raw def literally named as an export macro
+                                     * that overlaps the adopted type is the
+                                     * `class MOD_API Foo` artifact, whichever rule
+                                     * adopted the correction. */
+                                    if (d->label && cbm_def_label_is_type(d->label) && superseded) {
+                                        for (int j = 0; j < defs_before; j++) {
+                                            CBMDefinition *r = &result->defs.items[j];
+                                            if (superseded[j] || !r->name ||
+                                                r->start_line > d->end_line ||
+                                                d->start_line > r->end_line) {
+                                                continue;
+                                            }
+                                            for (int ci = 0; ci < export_cand_count; ci++) {
+                                                if (strcmp(r->name, export_cands[ci]) == 0) {
                                                     superseded[j] = 1;
                                                     break;
                                                 }
