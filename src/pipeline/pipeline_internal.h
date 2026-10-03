@@ -740,6 +740,13 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
  * post-pass sequence. */
 void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx);
 
+/* Pre-dump pass: properties derived from where a file sits ("path_properties"
+ * in the user config, e.g. toolset = the directory under Tools). Each value depends only on
+ * the node's own path, so the pass can run anywhere before the dump, on a full
+ * index or on the changed part of an incremental one. A key that is already
+ * present is left as it is. */
+void cbm_pipeline_pass_path_properties(cbm_pipeline_ctx_t *ctx);
+
 /* Gathered inputs for one symbol. Each scoring route fills this its own way
  * (gbuf lookups, or SQL aggregates) and then calls the ONE rule below. */
 typedef struct {

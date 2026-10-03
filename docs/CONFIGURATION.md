@@ -6,8 +6,8 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 
 | Purpose | Path | Format | Notes |
 |---|---|---|---|
-| Global custom extension mapping | `$XDG_CONFIG_HOME/codebase-memory-mcp/config.json` | JSON | Falls back to `~/.config/codebase-memory-mcp/config.json` when `XDG_CONFIG_HOME` is unset. |
-| Per-project custom extension mapping | `{repo_root}/.codebase-memory.json` | JSON | Overrides conflicting global `extra_extensions` entries. |
+| Global custom extension mapping and path properties | `$XDG_CONFIG_HOME/codebase-memory-mcp/config.json` | JSON | Falls back to `~/.config/codebase-memory-mcp/config.json` when `XDG_CONFIG_HOME` is unset. |
+| Per-project custom extension mapping and path properties | `{repo_root}/.codebase-memory.json` | JSON | Overrides conflicting global `extra_extensions` entries. |
 | CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. |
 | UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
 | Daemon operation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/cbm-daemon.log` | Structured log | Durable daemon lifecycle, watcher/indexing, UI, resource, and error events. |
@@ -61,6 +61,50 @@ Notes:
 - Unknown language names are skipped.
 - Missing files are ignored.
 - If the same extension appears in both files, the per-project file wins.
+
+### Path properties
+
+The same two files can also define node properties derived from where a file sits. Use this to group or filter by a unit that spans several folders and so has no single folder node, such as a component kept in both `Public/Tools/<name>/` and `Private/Tools/<name>/`.
+
+```json
+{
+  "path_properties": {
+    "toolset": "Tools/*",
+    "module": "*"
+  }
+}
+```
+
+Each entry maps a property name to directory names separated by `/`, exactly one of which is `*`. Every node whose file lies under a matching directory gets the property, set to the directory name `*` stands for:
+
+| File | `toolset` | `module` |
+|---|---|---|
+| `Domains/Public/Tools/Blueprint/Graph.h` | `Blueprint` | `Domains` |
+| `Domains/Private/Tools/Blueprint/Nodes/Graph.cpp` | `Blueprint` | `Domains` |
+| `Domains/Private/Tools/Registry.cpp` | *(none)* | `Domains` |
+| `Core/Private/Log.cpp` | *(none)* | `Core` |
+
+The property then works like any other in a query, on either end of a relationship:
+
+```cypher
+MATCH (a)-[r:CALLS]->(b)
+RETURN a.toolset, b.toolset, count(r)
+```
+
+```cypher
+MATCH (a)-[:SIMILAR_TO]->(b)
+WHERE a.toolset = 'Blueprint' AND b.toolset = 'Blueprint'
+RETURN a.name, a.file_path, b.name, b.file_path
+```
+
+Notes:
+
+- The pattern is matched against the directories of the repo-relative path, starting at any depth; the leftmost match wins. The file name itself never takes part, so a file directly inside `Tools/` gets no `toolset`.
+- Names are compared exactly, including case. `*` stands for one whole directory name; partial wildcards such as `Tool*` are not supported.
+- A property name must be a plain identifier (letters, digits, `_`). A property the indexer already writes under that name is left as it is.
+- Invalid entries are skipped with a warning; the other entries still apply.
+- If the same property appears in both files, the per-project file wins.
+- Changing either file causes a full re-index on the next run, so stored values always follow the current rules.
 
 ## 2. CLI-Managed Runtime Settings
 

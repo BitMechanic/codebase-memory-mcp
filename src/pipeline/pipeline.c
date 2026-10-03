@@ -1077,6 +1077,9 @@ static void predump_ensemble(cbm_pipeline_ctx_t *ctx) {
 static void predump_importance(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_importance(ctx);
 }
+static void predump_path_props(cbm_pipeline_ctx_t *ctx) {
+    cbm_pipeline_pass_path_properties(ctx);
+}
 
 /* Phase boundary for memory attribution. Two instruments, both already in
  * foundation/, both previously wired ONLY into MCP request handling and never
@@ -1301,6 +1304,7 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         bool moderate_only; /* true = skip in fast mode */
     } passes[] = {
         {predump_deco, "decorator_tags", false},
+        {predump_path_props, "path_properties", false},
         {predump_cfg, "configlink", false},
         {predump_doclinks, "doclinks", false},
         {predump_route, "route_match", false},

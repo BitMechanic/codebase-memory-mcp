@@ -1439,6 +1439,11 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
     }
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    cbm_pipeline_pass_path_properties(ctx);
+    cbm_log_info("pass.timing", "pass", "incr_path_properties", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     rc = cbm_pipeline_pass_configlink(ctx);
     cbm_log_info("pass.timing", "pass", "incr_configlink", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));

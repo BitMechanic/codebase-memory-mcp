@@ -8,6 +8,8 @@
  *
  * Project config wins over global. Unknown language values warn and are
  * skipped (fail-open). Missing files are silently ignored.
+ *
+ * Also reads path_properties from the same two files (see userconfig.h).
  */
 #include "discover/userconfig.h"
 #include "cbm.h" /* CBMLanguage, CBM_LANG_* */
@@ -251,13 +253,133 @@ static int parse_extra_extensions(yyjson_val *root, cbm_userext_t **entries, int
     return 0;
 }
 
+/* A property name must work as n.<name> in a query. */
+static bool path_prop_name_ok(const char *s) {
+    if (!isalpha((unsigned char)s[0]) && s[0] != '_') {
+        return false;
+    }
+    for (const char *c = s; *c; c++) {
+        if (!isalnum((unsigned char)*c) && *c != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Directory names separated by '/', exactly one of them "*". */
+static bool path_prop_pattern_ok(const char *s) {
+    int stars = 0;
+    while (*s) {
+        size_t len = strcspn(s, "/");
+        if (len == 0) {
+            return false; /* leading or doubled '/' */
+        }
+        if (memchr(s, '*', len)) {
+            if (len != SKIP_ONE) {
+                return false; /* "*" stands for a whole name only */
+            }
+            stars++;
+        }
+        s += len;
+        if (*s == '/' && !*++s) {
+            return false; /* trailing '/' */
+        }
+    }
+    return stars == SKIP_ONE;
+}
+
+static void free_path_props(cbm_userconfig_t *cfg) {
+    for (int i = 0; i < cfg->path_prop_count; i++) {
+        free(cfg->path_props[i].property);
+        free(cfg->path_props[i].pattern);
+    }
+    free(cfg->path_props);
+    cfg->path_props = NULL;
+    cfg->path_prop_count = 0;
+}
+
 /*
- * Read a JSON file and parse extra_extensions from it.
+ * Parse path_properties from a yyjson object root into cfg. A property that is
+ * already present gets the new pattern, so the project file (read second) wins
+ * over the global one. Invalid entries warn and are skipped (fail-open).
+ *
+ * Returns 0 on success, -1 on alloc failure.
+ */
+static int parse_path_properties(yyjson_val *root, cbm_userconfig_t *cfg,
+                                 const char *source_label) {
+    yyjson_val *props = yyjson_obj_get(root, "path_properties");
+    if (!props) {
+        return 0; /* key absent — fine */
+    }
+    if (!yyjson_is_obj(props)) {
+        cbm_log_warn("userconfig.bad_path_properties", "file", source_label);
+        return 0;
+    }
+
+    yyjson_obj_iter iter;
+    yyjson_obj_iter_init(props, &iter);
+    yyjson_val *key;
+    while ((key = yyjson_obj_iter_next(&iter)) != NULL) {
+        const char *name = yyjson_get_str(key);
+        const char *pattern_str = yyjson_get_str(yyjson_obj_iter_get_val(key));
+
+        if (!name || !pattern_str) {
+            cbm_log_warn("userconfig.skip_non_string", "file", source_label);
+            continue;
+        }
+
+        char *pattern = strdup(pattern_str);
+        if (!pattern) {
+            return CBM_NOT_FOUND;
+        }
+        for (char *c = pattern; *c; c++) {
+            if (*c == '\\') {
+                *c = '/';
+            }
+        }
+
+        if (!path_prop_name_ok(name) || !path_prop_pattern_ok(pattern)) {
+            cbm_log_warn("userconfig.skip_bad_path_property", "file", source_label, "property",
+                         name);
+            free(pattern);
+            continue;
+        }
+
+        int slot = 0;
+        while (slot < cfg->path_prop_count && strcmp(cfg->path_props[slot].property, name) != 0) {
+            slot++;
+        }
+        if (slot < cfg->path_prop_count) {
+            free(cfg->path_props[slot].pattern);
+            cfg->path_props[slot].pattern = pattern;
+            continue;
+        }
+
+        cbm_path_prop_t *tmp = realloc(cfg->path_props, (size_t)(cfg->path_prop_count + SKIP_ONE) *
+                                                            sizeof(cbm_path_prop_t));
+        char *name_copy = strdup(name);
+        if (tmp) {
+            cfg->path_props = tmp;
+        }
+        if (!tmp || !name_copy) {
+            free(name_copy);
+            free(pattern);
+            return CBM_NOT_FOUND;
+        }
+        cfg->path_props[cfg->path_prop_count].property = name_copy;
+        cfg->path_props[cfg->path_prop_count].pattern = pattern;
+        cfg->path_prop_count++;
+    }
+    return 0;
+}
+
+/*
+ * Read a JSON file and parse extra_extensions and path_properties from it.
  * Silently ignores missing files. Logs warnings for corrupt JSON.
  * Returns 0 on success (or absent file), -1 on alloc failure.
  */
 static int load_config_file(const char *path, cbm_userext_t **entries, int *count,
-                            char source_sha256[CBM_SHA256_HEX_LEN + 1]) {
+                            cbm_userconfig_t *cfg, char source_sha256[CBM_SHA256_HEX_LEN + 1]) {
     userconfig_source_digest("missing-or-unreadable", NULL, 0, source_sha256);
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
@@ -311,6 +433,9 @@ static int load_config_file(const char *path, cbm_userext_t **entries, int *coun
 
     yyjson_val *root = yyjson_doc_get_root(doc);
     int rc = parse_extra_extensions(root, entries, count, path);
+    if (rc == 0) {
+        rc = parse_path_properties(root, cfg, path);
+    }
     yyjson_doc_free(doc);
     return rc;
 }
@@ -333,11 +458,12 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
     char global_path[PATH_BUF_SZ];
     snprintf(global_path, sizeof(global_path), "%s/codebase-memory-mcp/config.json", cfg_fallback);
 
-    if (load_config_file(global_path, &entries, &count, cfg->global_source_sha256) != 0) {
+    if (load_config_file(global_path, &entries, &count, cfg, cfg->global_source_sha256) != 0) {
         for (int i = 0; i < count; i++) {
             free(entries[i].ext);
         }
         free(entries);
+        free_path_props(cfg);
         free(cfg);
         return NULL;
     }
@@ -350,12 +476,14 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
         char project_path[PATH_BUF_SZ];
         snprintf(project_path, sizeof(project_path), "%s/.codebase-memory.json", repo_path);
 
-        if (load_config_file(project_path, &entries, &count, cfg->project_source_sha256) != 0) {
+        if (load_config_file(project_path, &entries, &count, cfg, cfg->project_source_sha256) !=
+            0) {
             /* Free already-allocated entries */
             for (int i = 0; i < count; i++) {
                 free(entries[i].ext);
             }
             free(entries);
+            free_path_props(cfg);
             free(cfg);
             return NULL;
         }
@@ -410,6 +538,56 @@ CBMLanguage cbm_userconfig_lookup(const cbm_userconfig_t *cfg, const char *ext) 
     return CBM_LANG_COUNT;
 }
 
+size_t cbm_path_prop_value(const char *pattern, const char *rel_path, bool path_is_dir,
+                           const char **out) {
+    if (!pattern || !rel_path || !out) {
+        return 0;
+    }
+    /* Directories only: stop before the file name. */
+    const char *dirs_end = rel_path + strlen(rel_path);
+    if (!path_is_dir) {
+        dirs_end = strrchr(rel_path, '/');
+        if (!dirs_end) {
+            return 0;
+        }
+    }
+
+    for (const char *start = rel_path; start < dirs_end;) {
+        const char *pat = pattern;
+        const char *dir = start;
+        const char *value = NULL;
+        size_t value_len = 0;
+        bool matched = true;
+        while (*pat && matched) {
+            size_t pat_len = strcspn(pat, "/");
+            size_t dir_len = 0;
+            while (dir + dir_len < dirs_end && dir[dir_len] != '/') {
+                dir_len++;
+            }
+            if (dir >= dirs_end) {
+                matched = false; /* pattern is longer than what is left of the path */
+            } else if (pat_len == SKIP_ONE && pat[0] == '*') {
+                value = dir;
+                value_len = dir_len;
+            } else if (pat_len != dir_len || memcmp(pat, dir, pat_len) != 0) {
+                matched = false;
+            }
+            pat += pat_len + (pat[pat_len] == '/');
+            dir += dir_len + (dir + dir_len < dirs_end);
+        }
+        if (matched && value_len > 0) {
+            *out = value;
+            return value_len;
+        }
+        const char *slash = memchr(start, '/', (size_t)(dirs_end - start));
+        if (!slash) {
+            break;
+        }
+        start = slash + SKIP_ONE;
+    }
+    return 0;
+}
+
 void cbm_userconfig_free(cbm_userconfig_t *cfg) {
     if (!cfg) {
         return;
@@ -418,5 +596,6 @@ void cbm_userconfig_free(cbm_userconfig_t *cfg) {
         free(cfg->entries[i].ext);
     }
     free(cfg->entries);
+    free_path_props(cfg);
     free(cfg);
 }
