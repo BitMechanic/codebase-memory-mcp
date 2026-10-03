@@ -62,6 +62,12 @@ TEST(lang_ext_hpp) {
     ASSERT_EQ(cbm_language_for_extension(".hpp"), CBM_LANG_CPP);
     PASS();
 }
+TEST(lang_ext_inl) {
+    /* Inline-implementation files are C++; unindexed, every include of one and
+     * every include inside one had no File node to attach to. */
+    ASSERT_EQ(cbm_language_for_extension(".inl"), CBM_LANG_CPP);
+    PASS();
+}
 TEST(lang_ext_cc) {
     ASSERT_EQ(cbm_language_for_extension(".cc"), CBM_LANG_CPP);
     PASS();
@@ -1330,6 +1336,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_java);
     RUN_TEST(lang_ext_cpp);
     RUN_TEST(lang_ext_hpp);
+    RUN_TEST(lang_ext_inl);
     RUN_TEST(lang_ext_cc);
     RUN_TEST(lang_ext_cxx);
     RUN_TEST(lang_ext_hxx);

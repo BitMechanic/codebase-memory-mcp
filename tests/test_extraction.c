@@ -3599,6 +3599,79 @@ TEST(c_imports) {
     PASS();
 }
 
+/* An include line inside a conditional block, an extern "C" block or a
+ * namespace body is still an include of the file. Only the root's direct
+ * children were read, so a file wrapped in one #if (every Unreal automation
+ * test sits inside `#if WITH_DEV_AUTOMATION_TESTS`) lost all of its includes. */
+TEST(cpp_imports_inside_conditional_blocks) {
+    CBMFileResult *r = extract("#include \"Top.h\"\n"
+                               "#if WITH_TESTS\n"
+                               "#include \"Guarded.h\"\n"
+                               "#elif WITH_OTHER\n"
+                               "#include \"InElif.h\"\n"
+                               "#else\n"
+                               "#include \"InElse.h\"\n"
+                               "#endif\n"
+                               "#ifdef OUTER\n"
+                               "#ifndef INNER\n"
+                               "#include \"Nested.h\"\n"
+                               "#endif\n"
+                               "#endif\n"
+                               "extern \"C\" {\n"
+                               "#include \"Linked.h\"\n"
+                               "}\n"
+                               "namespace N {\n"
+                               "#include \"InNamespace.h\"\n"
+                               "}\n"
+                               "int main() { return 0; }\n",
+                               CBM_LANG_CPP, "t", "main.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_import(r, "Top.h"));
+    ASSERT(has_import(r, "Guarded.h"));
+    ASSERT(has_import(r, "InElif.h"));
+    ASSERT(has_import(r, "InElse.h"));
+    ASSERT(has_import(r, "Nested.h"));
+    ASSERT(has_import(r, "Linked.h"));
+    ASSERT(has_import(r, "InNamespace.h"));
+    ASSERT_EQ(r->imports.count, 7); /* each include once */
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(c_imports_inside_conditional_blocks) {
+    CBMFileResult *r = extract("#include <stdio.h>\n"
+                               "#ifdef _WIN32\n"
+                               "#include \"win_only.h\"\n"
+                               "#else\n"
+                               "#include \"posix_only.h\"\n"
+                               "#endif\n"
+                               "int main(void) { return 0; }\n",
+                               CBM_LANG_C, "t", "main.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_import(r, "stdio.h"));
+    ASSERT(has_import(r, "win_only.h"));
+    ASSERT(has_import(r, "posix_only.h"));
+    ASSERT_EQ(r->imports.count, 3);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* "Dir\File.h" names the same file as "Dir/File.h" to every compiler that
+ * accepts it; the resolver only knows '/'. */
+TEST(cpp_imports_backslash_path_uses_forward_slashes) {
+    CBMFileResult *r = extract("#include \"Sub\\Dir\\Slashed.h\"\n"
+                               "#include <Sys\\Angle.h>\n"
+                               "int main() { return 0; }\n",
+                               CBM_LANG_CPP, "t", "main.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 2);
+    ASSERT(has_import(r, "Sub/Dir/Slashed.h"));
+    ASSERT(has_import(r, "Sys/Angle.h"));
+    ASSERT_FALSE(has_import(r, "\\"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(ruby_imports) {
     CBMFileResult *r = extract(
         "require 'json'\nrequire 'net/http'\nrequire_relative 'helpers'\n\nclass Foo; end\n",
@@ -6627,6 +6700,199 @@ TEST(extract_cpp_export_macro_inline_method_recovery_issue1989) {
     PASS();
 }
 
+/* Unreal reflection markers (UCLASS, USTRUCT, UENUM, UINTERFACE, UPROPERTY,
+ * UFUNCTION, UMETA, GENERATED_BODY) are empty at compile time and opaque to
+ * tree-sitter, exactly like the export macros of #1989, and need the same
+ * treatment: predefined as empty for the preprocessed pass. The four sources
+ * below are reduced copies of real plugin headers that the raw parse stored as
+ * a Function, as a Variable, or not at all. */
+static bool def_has_base(const CBMDefinition *d, const char *base) {
+    if (!d || !d->base_classes) {
+        return false;
+    }
+    for (const char **b = d->base_classes; *b; b++) {
+        if (strcmp(*b, base) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const CBMDefinition *find_def_labeled(CBMFileResult *r, const char *label,
+                                             const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && r->defs.items[i].label &&
+            strcmp(r->defs.items[i].name, name) == 0 &&
+            strcmp(r->defs.items[i].label, label) == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+TEST(extract_cpp_unreal_uenum_umeta_and_ustruct_members) {
+    /* UMETA(...) after each enumerator lost the enum entirely; the struct,
+     * with GENERATED_BODY and UPROPERTY members, was stored as a Function. */
+    CBMFileResult *r =
+        extract("#pragma once\n"
+                "\n"
+                "#include \"CoreMinimal.h\"\n"
+                "#include \"NNLayoutTypes.generated.h\"\n"
+                "\n"
+                "UENUM(BlueprintType)\n"
+                "enum class ENNLayoutBoundaryType : uint8\n"
+                "{\n"
+                "    Rectangle UMETA(DisplayName = \"Rectangle\"),\n"
+                "    Polygon UMETA(DisplayName = \"Polygon\")\n"
+                "};\n"
+                "\n"
+                "USTRUCT(BlueprintType)\n"
+                "struct RCTOOLSDOMAINS_API FNNLayoutBoundarySpec\n"
+                "{\n"
+                "    GENERATED_BODY()\n"
+                "\n"
+                "    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = \"Boundary\")\n"
+                "    ENNLayoutBoundaryType Type = ENNLayoutBoundaryType::Rectangle;\n"
+                "\n"
+                "    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = \"Boundary\")\n"
+                "    bool bPointsAreWorldSpace = false;\n"
+                "\n"
+                "    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = \"Boundary\")\n"
+                "    TArray<FVector> Points;\n"
+                "};\n",
+                CBM_LANG_CPP, "p", "LayoutTypes.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Enum", "ENNLayoutBoundaryType"), 1);
+    ASSERT_EQ(count_defs_named(r, "Class", "FNNLayoutBoundarySpec"), 1);
+    ASSERT_EQ(count_defs_named(r, "Function", "FNNLayoutBoundarySpec"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_unreal_uinterface_pair) {
+    /* The UINTERFACE class has no export macro, so the export-macro rescue
+     * never ran for it; its partner was stored as a Function. */
+    CBMFileResult *r = extract("#pragma once\n"
+                               "\n"
+                               "#include \"CoreMinimal.h\"\n"
+                               "#include \"UObject/Interface.h\"\n"
+                               "#include \"IRCTPCGActor.generated.h\"\n"
+                               "\n"
+                               "class UPCGComponent;\n"
+                               "\n"
+                               "UINTERFACE(MinimalAPI, Blueprintable)\n"
+                               "class URCTPCGActor : public UInterface\n"
+                               "{\n"
+                               "    GENERATED_BODY()\n"
+                               "};\n"
+                               "\n"
+                               "class RCTOOLSDOMAINS_API IRCTPCGActor\n"
+                               "{\n"
+                               "    GENERATED_BODY()\n"
+                               "\n"
+                               "public:\n"
+                               "    virtual FString GetStateJSON() const = 0;\n"
+                               "\n"
+                               "    virtual UPCGComponent* GetPCGComponent() const = 0;\n"
+                               "};\n",
+                               CBM_LANG_CPP, "p", "PCGActor.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *uclass = find_def_labeled(r, "Class", "URCTPCGActor");
+    ASSERT_NOT_NULL(uclass);
+    ASSERT(def_has_base(uclass, "UInterface"));
+    ASSERT_EQ(count_defs_named(r, "Class", "IRCTPCGActor"), 1);
+    ASSERT_EQ(count_defs_named(r, "Function", "IRCTPCGActor"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_unreal_uclass_actor_inline_methods_once) {
+    /* Stored as a Variable. Its two inline methods were free Functions; the
+     * rescued class brings them in as Methods, and each must be stored once. */
+    CBMFileResult *r = extract(
+        "#pragma once\n"
+        "\n"
+        "#include \"CoreMinimal.h\"\n"
+        "#include \"IRCTPCGActor.h\"\n"
+        "#include \"GameFramework/Actor.h\"\n"
+        "#include \"RCTFeatureComponent.generated.h\"\n"
+        "\n"
+        "UCLASS()\n"
+        "class RCTOOLSDOMAINS_API ARCTFeatureComponent : public AActor, public IRCTPCGActor\n"
+        "{\n"
+        "    GENERATED_BODY()\n"
+        "\n"
+        "public:\n"
+        "    ARCTFeatureComponent();\n"
+        "\n"
+        "    virtual bool ConfigureFromJSON(\n"
+        "        const TSharedPtr<FJsonObject>& ConfigJson,\n"
+        "        TSharedPtr<FJsonObject>& OutResult) override;\n"
+        "\n"
+        "    virtual FString GetActorType() const override { return TEXT(\"room\"); }\n"
+        "\n"
+        "    virtual UPCGComponent* GetPCGComponent() const override { return PCGComponent; }\n"
+        "\n"
+        "protected:\n"
+        "    virtual void BeginPlay() override;\n"
+        "\n"
+        "public:\n"
+        "    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = \"Components\")\n"
+        "    TObjectPtr<UPCGComponent> PCGComponent;\n"
+        "};\n",
+        CBM_LANG_CPP, "p", "FeatureComponent.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def_labeled(r, "Class", "ARCTFeatureComponent");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(def_has_base(cls, "AActor"));
+    ASSERT(def_has_base(cls, "IRCTPCGActor"));
+    ASSERT_EQ(count_defs_named(r, "Variable", "ARCTFeatureComponent"), 0);
+    ASSERT_EQ(count_defs_named(r, "Method", "GetActorType"), 1);
+    ASSERT_EQ(count_defs_named(r, "Function", "GetActorType"), 0);
+    ASSERT_EQ(count_defs_named(r, "Method", "GetPCGComponent"), 1);
+    ASSERT_EQ(count_defs_named(r, "Function", "GetPCGComponent"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_export_macro_class_with_base_and_inline_bodies) {
+    /* No reflection markers at all: the #1989 rescue parsed this class
+     * correctly and then discarded it, because the raw pass had left a Function
+     * of the same name with a shorter span. Every tool provider in the plugin
+     * has this shape. */
+    CBMFileResult *r = extract(
+        "#pragma once\n"
+        "\n"
+        "#include \"CoreMinimal.h\"\n"
+        "#include \"Tools/IRCTToolProvider.h\"\n"
+        "\n"
+        "class FJsonObject;\n"
+        "\n"
+        "class RCTOOLSDOMAINS_API FRCTNNDungeonToolProvider : public IRCTToolProvider\n"
+        "{\n"
+        "public:\n"
+        "    virtual FString GetCategory() const override { return TEXT(\"NodeNinjaDungeon\"); }\n"
+        "    virtual FString GetCategoryDescription() const override { return TEXT(\"NodeNinja "
+        "rectilinear dungeon plan tools.\"); }\n"
+        "    virtual void GetToolDefinitions(TArray<TSharedPtr<FJsonObject>>& OutTools) override;\n"
+        "    virtual bool ExecuteTool(\n"
+        "        const FString& ToolName,\n"
+        "        const TSharedPtr<FJsonObject>& Arguments,\n"
+        "        TSharedPtr<FJsonObject>& OutResult) override;\n"
+        "};\n",
+        CBM_LANG_CPP, "p", "ToolProvider.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def_labeled(r, "Class", "FRCTNNDungeonToolProvider");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(def_has_base(cls, "IRCTToolProvider"));
+    ASSERT_EQ(count_defs_named(r, "Function", "FRCTNNDungeonToolProvider"), 0);
+    ASSERT_EQ(count_defs_named(r, "Method", "GetCategory"), 1);
+    ASSERT_EQ(count_defs_named(r, "Method", "GetCategoryDescription"), 1);
+    ASSERT_EQ(count_defs_named(r, "Function", "GetCategoryDescription"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Negative control the maintainer asked for: ordinary ALL_CAPS identifiers
  * (constants, enum values) must NOT be swept in as export-macro candidates and
  * stripped from the graph. Only the narrow _API/_EXPORT/... suffix shape is. */
@@ -9162,6 +9428,9 @@ SUITE(extraction) {
     RUN_TEST(java_imports);
     RUN_TEST(rust_imports);
     RUN_TEST(c_imports);
+    RUN_TEST(cpp_imports_inside_conditional_blocks);
+    RUN_TEST(c_imports_inside_conditional_blocks);
+    RUN_TEST(cpp_imports_backslash_path_uses_forward_slashes);
     RUN_TEST(ruby_imports);
     RUN_TEST(lua_imports);
     RUN_TEST(import_stress_go);
@@ -9272,6 +9541,10 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_export_macro_enum_recovery_issue1989);
     RUN_TEST(extract_cpp_export_macro_free_function_recovery_issue1989);
     RUN_TEST(extract_cpp_export_macro_inline_method_recovery_issue1989);
+    RUN_TEST(extract_cpp_unreal_uenum_umeta_and_ustruct_members);
+    RUN_TEST(extract_cpp_unreal_uinterface_pair);
+    RUN_TEST(extract_cpp_unreal_uclass_actor_inline_methods_once);
+    RUN_TEST(extract_cpp_export_macro_class_with_base_and_inline_bodies);
     RUN_TEST(extract_cpp_export_macro_negative_control_ordinary_caps_issue1989);
     RUN_TEST(extract_c_export_macro_recovery_issue1989);
     RUN_TEST(extract_cpp_export_macro_overlong_candidate_safe_issue1989);

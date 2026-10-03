@@ -6271,6 +6271,498 @@ TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+/* ── C/C++ across files: classes, methods, calls, includes, path properties ──
+ *
+ * The fixtures mirror an Unreal-style layout: a class declared under
+ * Public/Tools/<X>/, its methods defined under Private/Tools/<X>/. Every
+ * assertion marked RED failed before the change it names. */
+
+/* Count edges of one type from a named node in one file to a named node. */
+static int named_edge_from_file_count(cbm_store_t *s, const char *project, const char *edge_type,
+                                      const char *source_name, const char *source_file_path,
+                                      const char *target_name) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.name && source.file_path &&
+            strcmp(source.name, source_name) == 0 && strcmp(target.name, target_name) == 0 &&
+            strcmp(source.file_path, source_file_path) == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* Count edges of one type whose target is not a File node. */
+static int edges_to_non_file_count(cbm_store_t *s, const char *project, const char *edge_type) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t target = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK) {
+            if (!target.label || strcmp(target.label, "File") != 0) {
+                matches++;
+            }
+        }
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* How many nodes with this name and label carry `needle` in their properties
+ * exactly once (twice would be a duplicated key). */
+static int nodes_with_property_once(cbm_store_t *s, const char *project, const char *name,
+                                    const char *label, const char *needle) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(s, project, name, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        if (!nodes[i].label || strcmp(nodes[i].label, label) != 0 || !nodes[i].properties_json) {
+            continue;
+        }
+        const char *first = strstr(nodes[i].properties_json, needle);
+        if (first && !strstr(first + strlen(needle), needle)) {
+            found++;
+        }
+    }
+    if (nodes) {
+        cbm_store_free_nodes(nodes, count);
+    }
+    return found;
+}
+
+static void write_cpp_split_class_fixture(const char *tmp) {
+    write_temp_file(tmp, "Public/Tools/Alpha/AlphaThing.h",
+                    "class FAlphaThing\n"
+                    "{\n"
+                    "public:\n"
+                    "    int Run(int X);\n"
+                    "    int Twice(int X) { return X * 2; }\n"
+                    "};\n");
+    write_temp_file(tmp, "Private/Tools/Alpha/AlphaThing.cpp",
+                    "#include \"Tools/Alpha/AlphaThing.h\"\n"
+                    "\n"
+                    "int FAlphaThing::Run(int X)\n"
+                    "{\n"
+                    "    return Twice(X) + 1;\n"
+                    "}\n");
+}
+
+static void write_cpp_call_guard_fixture(const char *tmp) {
+    /* Two project methods share the name Add, so a name-only match has to guess. */
+    write_temp_file(tmp, "Bag.h", "class FBag\n{\npublic:\n    void Add(int X);\n};\n");
+    write_temp_file(tmp, "Bag.cpp",
+                    "#include \"Bag.h\"\n\nvoid FBag::Add(int X)\n{\n    (void)X;\n}\n");
+    write_temp_file(tmp, "Crate.h", "class FCrate\n{\npublic:\n    void Add(int X);\n};\n");
+    write_temp_file(tmp, "Crate.cpp",
+                    "#include \"Crate.h\"\n\nvoid FCrate::Add(int X)\n{\n    (void)X;\n}\n");
+    /* A container from a header outside the project: Items.Add is neither. */
+    write_temp_file(tmp, "EngineCaller.cpp",
+                    "#include \"Containers/Array.h\"\n"
+                    "#include \"Misc/Paths.h\"\n"
+                    "\n"
+                    "void FillEngineArray(TArray<int>& Items)\n"
+                    "{\n"
+                    "    Items.Add(1);\n"
+                    "}\n");
+    /* Typed receiver with the header included: resolved through the type. */
+    write_temp_file(tmp, "TypedCaller.cpp",
+                    "#include \"Bag.h\"\n\nvoid UseBag(FBag& Bag)\n{\n    Bag.Add(2);\n}\n");
+    /* A receiver that is an expression: `(A + B).Equals(B)` is a member call on
+     * a library type, not a call to the project's free function Equals. */
+    write_temp_file(tmp, "Equals.cpp", "bool Equals(int A, int B)\n{\n    return A == B;\n}\n");
+    write_temp_file(tmp, "ExpressionCaller.cpp",
+                    "#include \"Containers/UnrealString.h\"\n"
+                    "\n"
+                    "bool SameText(const FString& A, const FString& B)\n"
+                    "{\n"
+                    "    return (A + B).Equals(B);\n"
+                    "}\n");
+    /* A project function named like the engine header included above. */
+    write_temp_file(tmp, "Paths.cpp", "int Paths()\n{\n    return 0;\n}\n");
+    /* A free function matched by name, declared in a header the caller includes. */
+    write_temp_file(tmp, "Helper.h", "int HelperValue(int X);\n");
+    write_temp_file(tmp, "Helper.cpp",
+                    "#include \"Helper.h\"\n\nint HelperValue(int X)\n{\n    return X + 1;\n}\n");
+    write_temp_file(
+        tmp, "HelperCaller.cpp",
+        "#include \"Helper.h\"\n\nint CallsHelper()\n{\n    return HelperValue(1);\n}\n");
+    /* A free function declared in a header named differently from the source
+     * that defines it, and one declared by a prototype in the caller itself.
+     * Neither definition is in a file the caller can be seen to include. */
+    write_temp_file(tmp, "Api.h", "int ApiValue(int X);\n");
+    write_temp_file(tmp, "Impl.cpp", "int ApiValue(int X)\n{\n    return X * 2;\n}\n");
+    write_temp_file(tmp, "ApiCaller.cpp",
+                    "#include \"Api.h\"\n\nint CallsApi()\n{\n    return ApiValue(1);\n}\n");
+    /* A class whose method is defined inline in one source file and that the
+     * caller declares again for itself: the caller sees the class, so it may
+     * call the method. */
+    write_temp_file(tmp, "Gadget.cpp",
+                    "class FGadget\n"
+                    "{\n"
+                    "public:\n"
+                    "    int GadgetId() const { return 7; }\n"
+                    "};\n");
+    write_temp_file(tmp, "GadgetCaller.cpp",
+                    "class FGadget\n"
+                    "{\n"
+                    "public:\n"
+                    "    int GadgetId() const;\n"
+                    "};\n"
+                    "\n"
+                    "int ReadGadget(const FGadget& Gadget)\n"
+                    "{\n"
+                    "    return Gadget.GadgetId();\n"
+                    "}\n");
+    write_temp_file(tmp, "Lonely.cpp", "int LonelyValue(int X)\n{\n    return X * 3;\n}\n");
+    write_temp_file(tmp, "PrototypeCaller.cpp",
+                    "int LonelyValue(int X);\n"
+                    "\n"
+                    "int CallsLonely()\n"
+                    "{\n"
+                    "    return LonelyValue(1);\n"
+                    "}\n");
+}
+
+/* The extractor derives a method's parent class from the method's own file, so
+ * `Foo::Bar` in Private/.../Foo.cpp never met `class Foo` in Public/.../Foo.h.
+ * Fewer than 50 files exercises the sequential path. */
+TEST(pipeline_cpp_out_of_line_method_links_to_class_across_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_methods_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_cpp_split_class_fixture(tmp);
+    /* Two types share a name and both have bodies: only a same-named file may
+     * claim a method; anything else stays unlinked rather than guessed. */
+    write_temp_file(tmp, "Public/One/Dup.h",
+                    "struct FDup\n{\n    int First();\n    int InlineOne() { return 1; }\n};\n");
+    write_temp_file(tmp, "Public/Two/Other.h",
+                    "struct FDup\n{\n    int Second();\n    int InlineTwo() { return 2; }\n};\n");
+    write_temp_file(tmp, "Private/One/Dup.cpp",
+                    "#include \"One/Dup.h\"\n\nint FDup::First()\n{\n    return 1;\n}\n");
+    write_temp_file(tmp, "Private/Three/Impl.cpp",
+                    "#include \"Two/Other.h\"\n\nint FDup::Second()\n{\n    return 2;\n}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cpp_methods.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Anti-vacuous: the method exists where it is defined. */
+    ASSERT_GTE(
+        fixture_node_count(s, project, "Private/Tools/Alpha/AlphaThing.cpp", "Run", "Method"), 1);
+    /* RED: the out-of-line method belongs to the class in the header. */
+    ASSERT_EQ(named_edge_from_file_count(s, project, "DEFINES_METHOD", "FAlphaThing",
+                                         "Public/Tools/Alpha/AlphaThing.h", "Run"),
+              1);
+    /* Control: the inline method was always linked. */
+    ASSERT_EQ(named_edge_count(s, project, "DEFINES_METHOD", "FAlphaThing", "Twice"), 1);
+    /* RED: with two candidates the file of the same name wins ... */
+    ASSERT_EQ(named_edge_from_file_count(s, project, "DEFINES_METHOD", "FDup", "Public/One/Dup.h",
+                                         "First"),
+              1);
+    ASSERT_EQ(named_edge_count(s, project, "DEFINES_METHOD", "FDup", "First"), 1);
+    /* ... and with no such file the method is left unlinked. */
+    ASSERT_GTE(fixture_node_count(s, project, "Private/Three/Impl.cpp", "Second", "Method"), 1);
+    ASSERT_EQ(named_edge_count(s, project, "DEFINES_METHOD", "FDup", "Second"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* C/C++ counterpart of the receiver guards above. `Items.Add(x)` on a library
+ * container must not bind to whichever project method is called Add: with the
+ * receiver's type unknown and several candidates it is a guess. A name-only
+ * match is kept when the caller can see the target through its includes. An
+ * #include of a header outside the project must not resolve to a project
+ * symbol of that name. Fewer than 50 files exercises pass_calls.c. */
+TEST(pipeline_cpp_name_only_call_needs_visible_target) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_calls_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_cpp_call_guard_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cpp_calls.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(fixture_node_count(s, project, "EngineCaller.cpp", "FillEngineArray", "Function"),
+               1);
+    ASSERT_GTE(fixture_node_count(s, project, "Bag.cpp", "Add", "Method"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "Crate.cpp", "Add", "Method"), 1);
+    /* (1) RED: the guessed edge is gone. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "FillEngineArray", "Add"));
+    /* (1b) RED: nor is a member call on an expression bound to a free function. */
+    ASSERT_GTE(fixture_node_count(s, project, "Equals.cpp", "Equals", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "ExpressionCaller.cpp", "SameText", "Function"), 1);
+    ASSERT_FALSE(cross_file_call_exists(s, project, "SameText", "Equals"));
+    /* (2) The type-resolved call survives. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "UseBag", "Add"));
+    /* (3) A name-only match the caller can see through an include survives. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "CallsHelper", "HelperValue"));
+    /* (3b) So does a bare call to the project's only free function of that
+     * name, however it was declared: prototypes are not in the graph. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "CallsApi", "ApiValue"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "CallsLonely", "LonelyValue"));
+    /* (3c) And a method whose class the caller declares for itself. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "ReadGadget", "GadgetId"));
+    /* (4) RED: "Misc/Paths.h" is not the project function Paths. */
+    ASSERT_GTE(named_edge_count(s, project, "IMPORTS", "TypedCaller.cpp", "Bag.h"), 1);
+    ASSERT_EQ(edges_to_non_file_count(s, project, "IMPORTS"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* The same two rules on the parallel path (pass_parallel.c and the registry
+ * built from the result cache), which has its own call sites for both. */
+TEST(pipeline_cpp_parallel_method_links_and_call_guard) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_cpp_split_class_fixture(tmp);
+    write_cpp_call_guard_fixture(tmp);
+    /* Pad past MIN_FILES_FOR_PARALLEL (50) so the parallel resolver runs. */
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "Filler/Filler%d.cpp", i);
+        snprintf(body, sizeof(body), "int Filler%d()\n{\n    return %d;\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1); /* force parallel regardless of host cores */
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cpp_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* RED: method linked to its class across directories. */
+    ASSERT_EQ(named_edge_from_file_count(s, project, "DEFINES_METHOD", "FAlphaThing",
+                                         "Public/Tools/Alpha/AlphaThing.h", "Run"),
+              1);
+    /* RED: no guessed call, no include resolved to a symbol. */
+    ASSERT_GTE(fixture_node_count(s, project, "EngineCaller.cpp", "FillEngineArray", "Function"),
+               1);
+    ASSERT_FALSE(cross_file_call_exists(s, project, "FillEngineArray", "Add"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "SameText", "Equals"));
+    ASSERT_EQ(edges_to_non_file_count(s, project, "IMPORTS"), 0);
+    /* The real edges are still there. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "UseBag", "Add"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "CallsHelper", "HelperValue"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "CallsApi", "ApiValue"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "CallsLonely", "LonelyValue"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "Run", "Twice"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* #include lines below the top level of a file, paths written with
+ * backslashes, and .inl files, end to end: each must become an IMPORTS edge
+ * between File nodes. */
+TEST(pipeline_cpp_includes_in_blocks_backslash_and_inl) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_incl_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Top.h", "int TopValue();\n");
+    write_temp_file(tmp, "Guarded.h", "int GuardedValue();\n");
+    write_temp_file(tmp, "Other.h", "int OtherValue();\n");
+    write_temp_file(tmp, "Linked.h", "int LinkedValue();\n");
+    write_temp_file(tmp, "Sub/Slashed.h", "int SlashedValue();\n");
+    write_temp_file(tmp, "Fixture.inl",
+                    "#include \"Other.h\"\n\ninline int FixtureValue()\n{\n    return 1;\n}\n");
+    write_temp_file(tmp, "Main.cpp",
+                    "#include \"Top.h\"\n"
+                    "\n"
+                    "#if WITH_TESTS\n"
+                    "#include \"Guarded.h\"\n"
+                    "#else\n"
+                    "#include \"Other.h\"\n"
+                    "#endif\n"
+                    "\n"
+                    "extern \"C\" {\n"
+                    "#include \"Linked.h\"\n"
+                    "}\n"
+                    "\n"
+                    "#include \"Sub\\Slashed.h\"\n"
+                    "#include \"Fixture.inl\"\n"
+                    "\n"
+                    "int MainValue()\n"
+                    "{\n"
+                    "    return 0;\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cpp_incl.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Control: a top-level include was always linked. */
+    ASSERT_EQ(named_edge_count(s, project, "IMPORTS", "Main.cpp", "Top.h"), 1);
+    /* RED: inside #if / #else and extern "C". */
+    ASSERT_EQ(named_edge_count(s, project, "IMPORTS", "Main.cpp", "Guarded.h"), 1);
+    ASSERT_EQ(named_edge_count(s, project, "IMPORTS", "Main.cpp", "Other.h"), 1);
+    ASSERT_EQ(named_edge_count(s, project, "IMPORTS", "Main.cpp", "Linked.h"), 1);
+    /* RED: a backslash path reaches the File node. */
+    ASSERT_EQ(named_edge_count(s, project, "IMPORTS", "Main.cpp", "Slashed.h"), 1);
+    /* RED: an .inl file is indexed, can be included, and its own includes count. */
+    ASSERT_GTE(fixture_node_count(s, project, "Fixture.inl", "FixtureValue", "Function"), 1);
+    ASSERT_EQ(named_edge_count(s, project, "IMPORTS", "Main.cpp", "Fixture.inl"), 1);
+    ASSERT_EQ(named_edge_count(s, project, "IMPORTS", "Fixture.inl", "Other.h"), 1);
+    ASSERT_EQ(edges_to_non_file_count(s, project, "IMPORTS"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* path_properties in the project's .codebase-memory.json: every node under a
+ * matching folder carries the property, on a full index and after an
+ * incremental re-index of an edited file, and never twice. */
+TEST(pipeline_path_properties_label_nodes_by_folder) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_path_props_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, ".codebase-memory.json",
+                    "{\"path_properties\": {\"toolset\": \"Tools/*\"}}\n");
+    write_temp_file(tmp, "Mod/Public/Tools/Alpha/AlphaThing.h",
+                    "class FAlphaThing\n{\npublic:\n    int Run(int X);\n};\n");
+    write_temp_file(tmp, "Mod/Private/Tools/Alpha/AlphaThing.cpp",
+                    "#include \"Tools/Alpha/AlphaThing.h\"\n"
+                    "\n"
+                    "int FAlphaThing::Run(int X)\n"
+                    "{\n"
+                    "    return X;\n"
+                    "}\n");
+    write_temp_file(tmp, "Mod/Private/Tools/Loose.cpp",
+                    "int LooseInToolsRoot(int X)\n{\n    return X;\n}\n");
+    write_temp_file(tmp, "Mod/Private/Other/Plain.cpp",
+                    "int PlainOutside(int X)\n{\n    return X;\n}\n");
+
+    const char *alpha = "\"toolset\":\"Alpha\"";
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/path_props.db", tmp);
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    const char *project = cbm_pipeline_project_name(p1);
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+
+    /* Both halves of the unit, and every kind of node in them. */
+    ASSERT_EQ(nodes_with_property_once(s1, project, "FAlphaThing", "Class", alpha), 1);
+    ASSERT_EQ(nodes_with_property_once(s1, project, "Run", "Method", alpha), 1);
+    ASSERT_EQ(nodes_with_property_once(s1, project, "AlphaThing.h", "File", alpha), 1);
+    ASSERT_EQ(nodes_with_property_once(s1, project, "AlphaThing.cpp", "File", alpha), 1);
+    ASSERT_EQ(nodes_with_property_once(s1, project, "Alpha", "Folder", alpha), 2);
+    /* Not under a matching folder: a file directly in Tools/, a file elsewhere,
+     * and the Tools folders themselves. */
+    ASSERT_GTE(fixture_node_count(s1, project, "Mod/Private/Tools/Loose.cpp", "LooseInToolsRoot",
+                                  "Function"),
+               1);
+    ASSERT_EQ(nodes_with_property_once(s1, project, "LooseInToolsRoot", "Function", "\"toolset\""),
+              0);
+    ASSERT_EQ(nodes_with_property_once(s1, project, "PlainOutside", "Function", "\"toolset\""), 0);
+    ASSERT_EQ(nodes_with_property_once(s1, project, "Tools", "Folder", "\"toolset\""), 0);
+    cbm_store_close(s1);
+    cbm_pipeline_free(p1);
+
+    /* Edit a body only: the re-index takes the incremental route and re-reads
+     * just this file. Its nodes must come back with the property, once. */
+    write_temp_file(tmp, "Mod/Private/Tools/Alpha/AlphaThing.cpp",
+                    "#include \"Tools/Alpha/AlphaThing.h\"\n"
+                    "\n"
+                    "int FAlphaThing::Run(int X)\n"
+                    "{\n"
+                    "    return X + 1;\n"
+                    "}\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    /* Anti-vacuous: a full rebuild would pass the checks below without ever
+     * running the incremental post-passes. */
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    const char *project2 = cbm_pipeline_project_name(p2);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    ASSERT_EQ(nodes_with_property_once(s2, project2, "Run", "Method", alpha), 1);
+    ASSERT_EQ(nodes_with_property_once(s2, project2, "AlphaThing.cpp", "File", alpha), 1);
+    ASSERT_EQ(nodes_with_property_once(s2, project2, "FAlphaThing", "Class", alpha), 1);
+    cbm_store_close(s2);
+    cbm_pipeline_free(p2);
+
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Python counterpart to the TS/JS receiver guard (#1276), sequential path.
  * Pins BOTH directions. NEGATIVE: an attribute call on an unknown receiver
  * (a parameter) must not bind the lone same-named project method through
@@ -16341,6 +16833,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries);
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_cpp_out_of_line_method_links_to_class_across_files);
+    RUN_TEST(pipeline_cpp_name_only_call_needs_visible_target);
+    RUN_TEST(pipeline_cpp_parallel_method_links_and_call_guard);
+    RUN_TEST(pipeline_cpp_includes_in_blocks_backslash_and_inl);
+    RUN_TEST(pipeline_path_properties_label_nodes_by_folder);
     RUN_TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916);
     RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
