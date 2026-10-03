@@ -1762,7 +1762,12 @@ static bool python_external_hit_rejected(const CBMImport *imp, const char *name,
  * whose import genuinely can name a member (Python `from m import f`, Java
  * `import com.example.Foo`, Rust `use crate::ops::helper`) keep it. */
 bool cbm_import_symbol_fallback_allowed(CBMLanguage lang) {
-    return lang != CBM_LANG_GO;
+    /* C and C++: `#include "Misc/Paths.h"` names a file — never a function,
+     * method or class. A header that is not in the project is external and the
+     * correct result is NO edge; the fallback bound it to whichever project
+     * symbol happened to be called `Paths`, which also made that symbol's file
+     * look included to the call resolver. */
+    return lang != CBM_LANG_GO && lang != CBM_LANG_C && lang != CBM_LANG_CPP;
 }
 
 static const char *path_leaf(const char *path) {

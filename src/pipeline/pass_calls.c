@@ -887,6 +887,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
         return 0;
     }
+    /* C/C++: drop a name-only match the caller cannot see through its includes,
+     * and an ambiguous member call. MUST match pass_parallel.c exactly. */
+    if (cbm_suppress_c_family_weak_call(lang, call->is_method, res.strategy, rel, ctx->gbuf,
+                                        target_node, imp_vals, imp_count)) {
+        return 0;
+    }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
                          imp_count, drop_plain_call);
     return SKIP_ONE;

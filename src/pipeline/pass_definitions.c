@@ -502,6 +502,71 @@ int cbm_pipeline_link_cross_file_methods(cbm_pipeline_ctx_t *ctx) {
     return linked;
 }
 
+/* ── C/C++ call visibility ───────────────────────────────────────── */
+
+/* True when `file` is the caller's own file or its same-name header/source, or
+ * a file the caller includes directly. */
+static bool file_visible_to_caller(const cbm_gbuf_t *gbuf, const char *file,
+                                   const char *caller_file, const char **import_vals,
+                                   int import_count) {
+    if (!file) {
+        return false;
+    }
+    if (same_file_stem(file, caller_file)) {
+        return true;
+    }
+    for (int i = 0; i < import_count; i++) {
+        const cbm_gbuf_node_t *included =
+            import_vals[i] ? cbm_gbuf_find_by_qn(gbuf, import_vals[i]) : NULL;
+        /* An include is a file; an import bound to anything else is not one. */
+        if (included && included->label && strcmp(included->label, "File") == 0 &&
+            same_file_stem(file, included->file_path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* C and C++: a translation unit can only call what it can see. A call the
+ * registry matched by name alone (suffix_match / unique_name / field_type_hint)
+ * is therefore kept only when the target is declared in the caller's own file,
+ * its same-name header or source, or a file it includes directly — where a
+ * method is declared by the file of its owning type. A member call matched by
+ * name among several candidates is dropped outright: with the receiver's type
+ * unknown, `Items.Add(x)` on a library container would bind to whichever
+ * project function happens to be called Add. Type-resolved calls (lsp_*) and
+ * the import- or scope-aware strategies are never touched. */
+bool cbm_suppress_c_family_weak_call(CBMLanguage caller_lang, bool is_method, const char *strategy,
+                                     const char *caller_file, const cbm_gbuf_t *gbuf,
+                                     const cbm_gbuf_node_t *target, const char **import_vals,
+                                     int import_count) {
+    if ((caller_lang != CBM_LANG_C && caller_lang != CBM_LANG_CPP) || !target || !strategy ||
+        !cbm_suppress_weak_member_match(true, true, strategy)) {
+        return false;
+    }
+    if (is_method && strcmp(strategy, "unique_name") != 0) {
+        return true;
+    }
+    if (!caller_file || !target->file_path) {
+        return false;
+    }
+    if (file_visible_to_caller(gbuf, target->file_path, caller_file, import_vals, import_count)) {
+        return false;
+    }
+    const cbm_gbuf_edge_t **owners = NULL;
+    int owner_count = 0;
+    if (cbm_gbuf_find_edges_by_target_type(gbuf, target->id, "DEFINES_METHOD", &owners,
+                                           &owner_count) == 0 &&
+        owner_count > 0) {
+        const cbm_gbuf_node_t *owner = cbm_gbuf_find_by_id(gbuf, owners[0]->source_id);
+        if (owner && file_visible_to_caller(gbuf, owner->file_path, caller_file, import_vals,
+                                            import_count)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Create Channel nodes + EMITS / LISTENS_ON edges for one file's channels.
  * Mirrors the parallel path in cbm_build_registry_from_cache — keep in sync. */
 /* Find the source node for a channel edge: enclosing function or file node. */

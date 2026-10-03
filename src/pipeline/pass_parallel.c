@@ -3152,6 +3152,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * CALLS edge across a language boundary. */
             continue;
         }
+        if (target_node && source_node->id != target_node->id &&
+            cbm_suppress_c_family_weak_call(lang, call->is_method, res.strategy, rel,
+                                            rc->main_gbuf, target_node, imp_vals, imp_count)) {
+            /* C/C++: drop a name-only match the caller cannot see through its
+             * includes, and an ambiguous member call. Same guard as pass_calls.c. */
+            continue;
+        }
         if (!target_node || source_node->id == target_node->id) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge

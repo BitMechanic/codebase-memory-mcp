@@ -657,6 +657,15 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
  * another file (pass_definitions.c). Call once every definition is registered. */
 int cbm_pipeline_link_cross_file_methods(cbm_pipeline_ctx_t *ctx);
 
+/* C/C++ only: true when a call matched by name alone must not become a CALLS
+ * edge, because the caller cannot see the target through its includes or the
+ * match is an ambiguous member call (pass_definitions.c). pass_calls.c and
+ * pass_parallel.c MUST both apply it, at the same point. */
+bool cbm_suppress_c_family_weak_call(CBMLanguage caller_lang, bool is_method, const char *strategy,
+                                     const char *caller_file, const cbm_gbuf_t *gbuf,
+                                     const cbm_gbuf_node_t *target, const char **import_vals,
+                                     int import_count);
+
 int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 
 int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
