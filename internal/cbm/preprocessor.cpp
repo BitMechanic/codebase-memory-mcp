@@ -407,6 +407,179 @@ int cbm_unreal_reflection_macro_count(const char *source, int source_len) {
     return count;
 }
 
+// ── Lines that hold nothing but an Unreal marker ─────────────────────
+// Unreal automation test declarations. Each declares a test class whose body
+// is the out-of-line RunTest method written right below it. The raw parse
+// indexes that method; only the class shell is absent from the graph.
+static const char *kUnrealTestDeclarationMacros[] = {"IMPLEMENT_SIMPLE_AUTOMATION_TEST",
+                                                     "IMPLEMENT_COMPLEX_AUTOMATION_TEST",
+                                                     "IMPLEMENT_CUSTOM_SIMPLE_AUTOMATION_TEST",
+                                                     "IMPLEMENT_CUSTOM_COMPLEX_AUTOMATION_TEST",
+                                                     "IMPLEMENT_NETWORKED_AUTOMATION_TEST",
+                                                     "IMPLEMENT_BDD_AUTOMATION_TEST",
+                                                     "IMPLEMENT_SIMPLE_AUTOMATION_TEST_PRIVATE",
+                                                     "IMPLEMENT_COMPLEX_AUTOMATION_TEST_PRIVATE",
+                                                     "IMPLEMENT_NETWORKED_AUTOMATION_TEST_PRIVATE",
+                                                     "IMPLEMENT_BDD_AUTOMATION_TEST_PRIVATE",
+                                                     "DEFINE_SPEC",
+                                                     "BEGIN_DEFINE_SPEC",
+                                                     "END_DEFINE_SPEC",
+                                                     NULL};
+
+static bool name_in_table(const char *const *table, const char *name, size_t len) {
+    for (int k = 0; table[k]; k++) {
+        if (strlen(table[k]) == len && strncmp(name, table[k], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Offset of the ')' that closes the '(' at `open`, skipping comments and
+// string literals. -1 when the parenthesis never closes or a raw string in
+// between cannot be recognized.
+static int matching_paren(const char *source, int source_len, int open) {
+    int depth = 0;
+    int i = open;
+    while (i < source_len) {
+        int code = skip_non_code(source, source_len, i);
+        if (code != i) {
+            i = code;
+            continue;
+        }
+        char c = source[i];
+        if (is_identifier_start(c)) {
+            int start = i;
+            while (i < source_len && is_identifier_char(source[i])) {
+                i++;
+            }
+            int raw = raw_string_after_prefix(source, source_len, start, i);
+            if (raw < 0) {
+                return -1;
+            }
+            if (raw > 0) {
+                i = raw;
+            }
+            continue;
+        }
+        if (c == '(') {
+            depth++;
+        } else if (c == ')') {
+            depth--;
+            if (depth == 0) {
+                return i;
+            }
+        }
+        i++;
+    }
+    return -1;
+}
+
+// One pass over the source: finds every invocation of a marker from the two
+// tables and sets `flag` on each line the invocation fills by itself. A line
+// that also carries other code is left alone: `UPROPERTY() int32 Count;` keeps
+// whatever verdict the parse gave it. With `line_flags` NULL nothing is
+// written. Returns the number of invocations found, or -1 when the scan cannot
+// be trusted (an unrecognizable raw string, the same poison rule as above, or
+// an invocation whose parenthesis never closes).
+static int scan_unreal_marker_lines(const char *source, int source_len, unsigned char *line_flags,
+                                    unsigned int line_count, unsigned char flag) {
+    int found = 0;
+    int i = 0;
+    int counted_to = 0;    // newlines before this offset are already in `line`
+    unsigned int line = 1; // 1-based line that offset counted_to sits on
+    int line_start = 0;    // offset where that line starts
+    while (i < source_len) {
+        i = skip_non_code(source, source_len, i);
+        if (i >= source_len) {
+            break;
+        }
+        if (!is_identifier_start(source[i])) {
+            i++;
+            continue;
+        }
+        int start = i;
+        while (i < source_len && is_identifier_char(source[i])) {
+            i++;
+        }
+        int raw = raw_string_after_prefix(source, source_len, start, i);
+        if (raw < 0) {
+            return -1;
+        }
+        if (raw > 0) {
+            i = raw;
+            continue;
+        }
+        size_t len = (size_t)(i - start);
+        if (!name_in_table(kUnrealReflectionMacros, source + start, len) &&
+            !name_in_table(kUnrealTestDeclarationMacros, source + start, len)) {
+            continue;
+        }
+        int open = i;
+        while (open < source_len && (source[open] == ' ' || source[open] == '\t')) {
+            open++;
+        }
+        if (open >= source_len || source[open] != '(') {
+            continue;
+        }
+        int close = matching_paren(source, source_len, open);
+        if (close < 0) {
+            return -1;
+        }
+        found++;
+
+        for (; counted_to < start; counted_to++) {
+            if (source[counted_to] == '\n') {
+                line++;
+                line_start = counted_to + 1;
+            }
+        }
+        unsigned int first_line = line;
+        bool head_clear = true;
+        for (int k = line_start; k < start; k++) {
+            if (source[k] != ' ' && source[k] != '\t') {
+                head_clear = false;
+                break;
+            }
+        }
+        for (; counted_to <= close; counted_to++) {
+            if (source[counted_to] == '\n') {
+                line++;
+                line_start = counted_to + 1;
+            }
+        }
+        unsigned int last_line = line;
+        int t = close + 1;
+        while (t < source_len && (source[t] == ' ' || source[t] == '\t' || source[t] == '\r')) {
+            t++;
+        }
+        bool tail_clear = t >= source_len || source[t] == '\n' ||
+                          (source[t] == '/' && t + 1 < source_len && source[t + 1] == '/');
+        if (line_flags) {
+            for (unsigned int l = first_line; l <= last_line && l <= line_count; l++) {
+                if ((l == first_line && !head_clear) || (l == last_line && !tail_clear)) {
+                    continue;
+                }
+                line_flags[l] |= flag;
+            }
+        }
+        i = close + 1;
+    }
+    return found;
+}
+
+void cbm_unreal_marker_lines(const char *source, int source_len, unsigned char *line_flags,
+                             unsigned int line_count, unsigned char flag) {
+    if (!source || source_len <= 0 || !line_flags || line_count == 0) {
+        return;
+    }
+    // Dry pass first: a scan that cannot be trusted must mark nothing at all.
+    if (scan_unreal_marker_lines(source, source_len, NULL, 0, 0) <= 0) {
+        return;
+    }
+    (void)scan_unreal_marker_lines(source, source_len, line_flags, line_count, flag);
+}
+
 // True when `defines` already holds a definition of `name`, object-like
 // ("NAME=...") or function-like ("NAME(...)=...").
 static bool define_is_provided(const std::list<std::string> &defines, const char *name) {

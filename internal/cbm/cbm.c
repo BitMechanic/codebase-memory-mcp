@@ -2067,6 +2067,60 @@ static uint32_t cbm_count_lines(const char *src, int src_len) {
     return n;
 }
 
+/* Unreal markers. A line that holds nothing but a reflection marker
+ * (UPROPERTY(...), GENERATED_BODY(), ...) or an automation test declaration
+ * (IMPLEMENT_SIMPLE_AUTOMATION_TEST(...), ...) is trimmed off both ends of
+ * every range, and a range made only of such lines is dropped.
+ *
+ * A reflection marker carries no construct of its own: it annotates the
+ * declaration on the lines around it, and those lines keep their own verdict.
+ * The second pass cannot clear it either. The marker is predefined empty
+ * there, so the expanded line is blank, and a blank line vouches for nothing.
+ * Left alone, every marker line of every Unreal header was reported as
+ * missing from the graph.
+ *
+ * An automation test declaration is trimmed for a different reason, and it is
+ * a deliberate trade. The declaration does introduce something the graph
+ * lacks, the test class shell, which is the #949 case. But the test body is an
+ * ordinary out-of-line method that the raw parse indexes, the missing shell is
+ * the same in every test file, and a flag on each declaration told a reader
+ * nothing they could act on.
+ *
+ * This runs last and does not depend on the second pass, which is skipped for
+ * a file that has no #define and no conditional directive. Lines that also
+ * carry other code are never trimmed: see cbm_unreal_marker_lines. */
+static void cbm_subtract_unreal_marker_regions(cbm_error_regions_t *regs, const char *src,
+                                               int src_len) {
+    if (regs->count <= 0 || !src || src_len <= 0) {
+        return;
+    }
+    uint32_t nlines = cbm_count_lines(src, src_len);
+    uint8_t *marks = (uint8_t *)calloc((size_t)nlines + 2, 1);
+    if (!marks) {
+        return;
+    }
+    cbm_unreal_marker_lines(src, src_len, marks, nlines, 1);
+    int kept = 0;
+    for (int i = 0; i < regs->count; i++) {
+        uint32_t s = regs->starts[i];
+        uint32_t e = regs->ends[i];
+        while (s <= e && s <= nlines && marks[s]) {
+            s++;
+        }
+        while (e >= s && e <= nlines && marks[e]) {
+            e--;
+        }
+        if (s > e) {
+            continue; /* nothing but marker lines */
+        }
+        regs->starts[kept] = s;
+        regs->ends[kept] = e;
+        kept++;
+    }
+    regs->count = kept;
+    free(marks);
+}
+
 /* Serialize collected regions as "start-end,start-end,...", with a trailing
  * ",+<N>" when the cap threw N ranges away.
  *
@@ -2996,6 +3050,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
          * refinement, because its evidence is per-line: a narrow range points at
          * the call itself instead of the whole blob around it. */
         cbm_subtract_macro_invocation_regions(&regs, &result->defs, source, source_len);
+        /* Lines that hold nothing but an Unreal marker are not a miss. */
+        if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
+            cbm_subtract_unreal_marker_regions(&regs, source, source_len);
+        }
         /* A file whose kept list is empty but whose cap still bound is NOT clean:
          * the ranges the cap threw away were never judged by the two rules
          * above, so nothing proves they were recovered. Flag it. */

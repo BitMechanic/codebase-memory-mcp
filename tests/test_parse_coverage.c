@@ -30,6 +30,7 @@
 
 #include "test_framework.h"
 #include "cbm.h"
+#include "preprocessor.h"      /* cbm_unreal_marker_lines */
 #include "sql_values.h"        /* #1735 value-row scanner */
 #include "foundation/compat.h" /* cbm_setenv / cbm_unsetenv */
 #include <stdarg.h>
@@ -1514,6 +1515,158 @@ TEST(jsx_broken_markup_still_parse_partial_issue1736) {
     PASS();
 }
 
+/* ── Unreal markers ───────────────────────────────────────────────────────
+ * A line that holds nothing but an Unreal reflection marker, or an Unreal
+ * automation test declaration, is not a construct the graph is missing. The
+ * controls use a marker the tool does not know, in the same position: that
+ * one must stay flagged, which also proves these shapes do raise the flag. */
+static const char *UE_HEADER_KNOWN_MARKERS =
+    "#pragma once\n"                                         /* 1 */
+    "#include \"CoreMinimal.h\"\n"                           /* 2 */
+    "#include \"Thing.generated.h\"\n"                       /* 3 */
+    "\n"                                                     /* 4 */
+    "USTRUCT(BlueprintType)\n"                               /* 5 */
+    "struct FThing\n"                                        /* 6 */
+    "{\n"                                                    /* 7 */
+    "\tGENERATED_BODY()\n"                                   /* 8 */
+    "\n"                                                     /* 9 */
+    "\tUPROPERTY()\n"                                        /* 10 */
+    "\tFString Name;\n"                                      /* 11 */
+    "\n"                                                     /* 12 */
+    "\tUPROPERTY(EditAnywhere, Category = \"Thing\",\n"      /* 13 */
+    "\t\tmeta = (ClampMin = \"0.1\", ClampMax = \"1.0\"))\n" /* 14 */
+    "\tfloat Scale = 1.0f;\n"                                /* 15 */
+    "};\n";                                                  /* 16 */
+
+static const char *UE_HEADER_UNKNOWN_MARKER = "#pragma once\n"                   /* 1 */
+                                              "#include \"CoreMinimal.h\"\n"     /* 2 */
+                                              "#include \"Thing.generated.h\"\n" /* 3 */
+                                              "\n"                               /* 4 */
+                                              "USTRUCT(BlueprintType)\n"         /* 5 */
+                                              "struct FThing\n"                  /* 6 */
+                                              "{\n"                              /* 7 */
+                                              "\tGENERATED_BODY()\n"             /* 8 */
+                                              "\n"                               /* 9 */
+                                              "\tHOUSE_MARKER(Replicated)\n"     /* 10 */
+                                              "\tFString Name;\n"                /* 11 */
+                                              "};\n";                            /* 12 */
+
+static const char *UE_TEST_DECLARATION =
+    "#include \"Misc/AutomationTest.h\"\n"                                           /* 1 */
+    "\n"                                                                             /* 2 */
+    "IMPLEMENT_SIMPLE_AUTOMATION_TEST(FThingTest, \"Proj.Thing.Basic\",\n"           /* 3 */
+    "\tEAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)\n" /* 4 */
+    "bool FThingTest::RunTest(const FString& Parameters)\n"                          /* 5 */
+    "{\n"                                                                            /* 6 */
+    "\treturn true;\n"                                                               /* 7 */
+    "}\n";                                                                           /* 8 */
+
+static const char *UE_TEST_DECLARATION_UNKNOWN =
+    "#include \"Misc/AutomationTest.h\"\n"                                           /* 1 */
+    "\n"                                                                             /* 2 */
+    "HOUSE_TEST(FThingTest, \"Proj.Thing.Basic\",\n"                                 /* 3 */
+    "\tEAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)\n" /* 4 */
+    "bool FThingTest::RunTest(const FString& Parameters)\n"                          /* 5 */
+    "{\n"                                                                            /* 6 */
+    "\treturn true;\n"                                                               /* 7 */
+    "}\n";                                                                           /* 8 */
+
+TEST(cpp_unreal_reflection_marker_lines_are_not_partial) {
+    CBMFileResult *r = do_extract(UE_HEADER_KNOWN_MARKERS, CBM_LANG_CPP, "Thing.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_def(r, "FThing"));
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(cpp_unknown_marker_line_stays_partial) {
+    CBMFileResult *r = do_extract(UE_HEADER_UNKNOWN_MARKER, CBM_LANG_CPP, "Thing.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    /* Only the unknown marker's line: GENERATED_BODY() on line 8 and
+     * USTRUCT(...) on line 5 are known and must not be named. */
+    ASSERT_STR_EQ(r->error_ranges, "10-10");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(cpp_unreal_test_declaration_lines_are_not_partial) {
+    CBMFileResult *r = do_extract(UE_TEST_DECLARATION, CBM_LANG_CPP, "ThingTests.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_def(r, "RunTest"));
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(cpp_unknown_test_declaration_stays_partial) {
+    CBMFileResult *r = do_extract(UE_TEST_DECLARATION_UNKNOWN, CBM_LANG_CPP, "ThingTests.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The line marker itself, one shape per line. */
+TEST(unreal_marker_lines_marks_only_lines_a_marker_fills) {
+    static const char *src = "UCLASS(Blueprintable)\n"             /* 1 marker alone */
+                             "class AThing : public AActor\n"      /* 2 */
+                             "{\n"                                 /* 3 */
+                             "\tGENERATED_BODY()   // generated\n" /* 4 marker, then a comment */
+                             "\tUPROPERTY() int32 Count;\n"        /* 5 marker shares the line */
+                             "\tUPROPERTY(EditAnywhere,\n"         /* 6 first line of two */
+                             "\t\tmeta = (ClampMin = \"0\"))\n"    /* 7 last line of two */
+                             "\tfloat Scale;\n"                    /* 8 */
+                             "\t// UPROPERTY() in a comment\n"     /* 9 */
+                             "\tFString Text = TEXT(\"UPROPERTY()\");" /* 10 in a string */
+                             "\n"
+                             "};\n"                                  /* 11 */
+                             "enum class EKind : uint8\n"            /* 12 */
+                             "{\n"                                   /* 13 */
+                             "\tFirst UMETA(DisplayName = \"1\"),\n" /* 14 marker after code */
+                             "};\n"                                  /* 15 */
+                             "IMPLEMENT_SIMPLE_AUTOMATION_TEST(FT, \"A.B\",\n"        /* 16 */
+                             "\tEAutomationTestFlags::EditorContext)\n"               /* 17 */
+                             "bool FT::RunTest(const FString& P) { return true; }\n"; /* 18 */
+    enum { LINES = 18, FLAG = 4 };
+    unsigned char map[LINES + 2];
+    memset(map, 0, sizeof(map));
+    cbm_unreal_marker_lines(src, (int)strlen(src), map, LINES, FLAG);
+    static const int marked[] = {1, 4, 6, 7, 16, 17};
+    int want[LINES + 2];
+    memset(want, 0, sizeof(want));
+    for (size_t i = 0; i < sizeof(marked) / sizeof(marked[0]); i++) {
+        want[marked[i]] = FLAG;
+    }
+    for (int l = 1; l <= LINES; l++) {
+        if (map[l] != want[l]) {
+            printf("  line %d: got %d, want %d\n", l, map[l], want[l]);
+        }
+        ASSERT_EQ((int)map[l], want[l]);
+    }
+    PASS();
+}
+
+/* A raw string the scanner cannot follow poisons the scan, exactly as it does
+ * for the marker count: nothing may be marked on a guess. */
+TEST(unreal_marker_lines_marks_nothing_when_the_scan_is_poisoned) {
+    static const char *src = "UCLASS()\n"                         /* 1 */
+                             "class AThing {};\n"                 /* 2 */
+                             "const char *k = R\"never closed\n"; /* 3 */
+    unsigned char map[5] = {0};
+    cbm_unreal_marker_lines(src, (int)strlen(src), map, 3, 4);
+    ASSERT_EQ((int)map[1], 0);
+    ASSERT_EQ((int)map[2], 0);
+    ASSERT_EQ((int)map[3], 0);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -1562,4 +1715,10 @@ SUITE(parse_coverage) {
     RUN_TEST(sql_dump_of_many_megabytes_is_indexed_not_timed_out_issue1735);
     RUN_TEST(jsx_lone_ampersand_is_not_parse_partial_issue1736);
     RUN_TEST(jsx_broken_markup_still_parse_partial_issue1736);
+    RUN_TEST(cpp_unreal_reflection_marker_lines_are_not_partial);
+    RUN_TEST(cpp_unknown_marker_line_stays_partial);
+    RUN_TEST(cpp_unreal_test_declaration_lines_are_not_partial);
+    RUN_TEST(cpp_unknown_test_declaration_stays_partial);
+    RUN_TEST(unreal_marker_lines_marks_only_lines_a_marker_fills);
+    RUN_TEST(unreal_marker_lines_marks_nothing_when_the_scan_is_poisoned);
 }

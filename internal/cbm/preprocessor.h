@@ -36,6 +36,16 @@ int cbm_export_macro_candidates(const char *source, int source_len,
 // as an empty function-like macro so the declarations around them parse.
 int cbm_unreal_reflection_macro_count(const char *source, int source_len);
 
+// Sets `flag` in line_flags[line] (1-based, line_count entries after index 0)
+// for every line that holds nothing but an invocation of an Unreal reflection
+// marker or of an Unreal automation test declaration (IMPLEMENT_*_AUTOMATION_TEST,
+// DEFINE_SPEC, ...), including the middle lines of an invocation that spans
+// several. Lines that also carry other code are not touched, and nothing is
+// marked when the scan cannot be trusted. Used by the parse-coverage report so
+// that such a line is not reported as a construct the graph is missing.
+void cbm_unreal_marker_lines(const char *source, int source_len, unsigned char *line_flags,
+                             unsigned int line_count, unsigned char flag);
+
 // Preprocess C/C++ source: expand macros, evaluate #ifdef, resolve #include.
 // Returns malloc-allocated expanded source, or NULL if no expansion needed/on failure.
 // extra_defines: NULL-terminated array of "NAME=VALUE" strings (can be NULL).
