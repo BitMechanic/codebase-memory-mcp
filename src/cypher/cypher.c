@@ -786,6 +786,8 @@ static void expr_free(cbm_expr_t *e) {
             safe_str_free(&cur->cond.property);
             safe_str_free(&cur->cond.op);
             safe_str_free(&cur->cond.value);
+            safe_str_free(&cur->cond.value_variable);
+            safe_str_free(&cur->cond.value_property);
             safe_str_free(&cur->cond.coalesce_default);
             for (int i = 0; i < cur->cond.in_value_count; i++) {
                 safe_str_free(&cur->cond.in_values[i]);
@@ -1079,7 +1081,8 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
 
 /* Parse the operator + value tail shared by every condition subject
  * (var[.prop] and multi-arg functions like coalesce(...)): IS [NOT] NULL,
- * IN [...], or a comparison operator with a literal value. */
+ * IN [...], or a comparison operator with a literal value or with a property
+ * of a bound variable. */
 static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
     /* IS NULL / IS NOT NULL */
     if (check(p, TOK_IS)) {
@@ -1123,6 +1126,25 @@ static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
     } else if (check(p, TOK_FALSE)) {
         advance(p);
         c->value = heap_strdup("false");
+    } else if (check(p, TOK_IDENT) &&
+               !(p->pos + SKIP_ONE < p->count && p->tokens[p->pos + SKIP_ONE].type == TOK_LPAREN)) {
+        /* A property of a bound variable on the right: a.toolset <> b.toolset.
+         * A bare name is an alias, read the way a bare alias is on the left.
+         * A function call on the right is still not a value. */
+        c->value_variable = heap_strdup(advance(p)->text);
+        if (match(p, TOK_DOT)) {
+            const cbm_token_t *prop = expect(p, TOK_IDENT);
+            if (!prop) {
+                cond_func_fields_free(c);
+                safe_str_free(&c->variable);
+                safe_str_free(&c->property);
+                safe_str_free(&c->op);
+                safe_str_free(&c->coalesce_default);
+                safe_str_free(&c->value_variable);
+                return NULL;
+            }
+            c->value_property = heap_strdup(prop->text);
+        }
     } else {
         snprintf(p->error, sizeof(p->error), "expected value at pos %d", peek(p)->pos);
         cond_func_fields_free(c);
@@ -2161,6 +2183,8 @@ static void free_where(cbm_where_clause_t *w) {
         safe_str_free(&w->conditions[i].property);
         safe_str_free(&w->conditions[i].op);
         safe_str_free(&w->conditions[i].value);
+        safe_str_free(&w->conditions[i].value_variable);
+        safe_str_free(&w->conditions[i].value_property);
         for (int j = 0; j < w->conditions[i].in_value_count; j++) {
             safe_str_free(&w->conditions[i].in_values[j]);
         }
@@ -2594,6 +2618,25 @@ static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *
     return n->name ? n->name : "";
 }
 
+/* Resolve the right-hand side of `a.x <op> b.y` from a binding. NULL when the
+ * variable is not bound yet. Reads through the same accessors as the left-hand
+ * side; node_prop and edge_prop rotate their buffers, so the left value read
+ * just before this one stays intact. */
+static const char *resolve_condition_rhs(const cbm_condition_t *c, binding_t *b) {
+    cbm_edge_t *e = binding_get_edge(b, c->value_variable);
+    if (e) {
+        return edge_prop(e, c->value_property);
+    }
+    cbm_node_t *n = binding_get(b, c->value_variable);
+    if (!n) {
+        return NULL; /* unbound variable */
+    }
+    if (c->value_property) {
+        return node_prop(n, c->value_property, b->store);
+    }
+    return n->name ? n->name : "";
+}
+
 /* Evaluate a comparison operator between actual and expected strings. */
 static bool eval_comparison_op(const char *op, const char *actual, const char *expected) {
     if (strcmp(op, "=") == 0) {
@@ -2716,7 +2759,16 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
         return c->negated ? !result : result;
     }
 
-    result = eval_comparison_op(c->op, actual, c->value);
+    const char *expected = c->value;
+    if (c->value_variable) {
+        /* a.x <op> b.y: an unbound right-hand variable leaves the condition
+         * undecided, exactly as an unbound left-hand one does above. */
+        expected = resolve_condition_rhs(c, b);
+        if (!expected) {
+            return true;
+        }
+    }
+    result = eval_comparison_op(c->op, actual, expected);
     return c->negated ? !result : result;
 }
 
@@ -5048,6 +5100,9 @@ static int cypher_cond_selectivity(const cbm_condition_t *c, const char *var) {
     }
     if (!c->op || strcmp(c->op, "=") != 0 || !c->property) {
         return 0;
+    }
+    if (c->value_variable) {
+        return 0; /* equal to another variable's property: nothing to seed a scan from */
     }
     return (strcmp(c->property, "name") == 0 || strcmp(c->property, "qualified_name") == 0) ? 3 : 2;
 }

@@ -210,6 +210,13 @@ typedef struct {
     const char *func;
     cbm_func_arg_t *args;
     int arg_count;
+    /* Property on the right-hand side of a comparison, e.g.
+     * `a.toolset <> b.toolset`. When value_variable is set, the comparison is
+     * against that bound variable's property (value_property NULL = the bare
+     * alias, as on the left) and `value` stays NULL. Tail fields: zero-init
+     * stays valid. */
+    const char *value_variable;
+    const char *value_property;
 } cbm_condition_t;
 
 /* Expression tree for WHERE clause */

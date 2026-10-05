@@ -4864,6 +4864,152 @@ TEST(cypher_exec_deadline_allows_normal_query_issue601) {
 
 /* ══════════════════════════════════════════════════════════════════ */
 
+/* ── A property on the right-hand side of a comparison ────────────────────
+ * `a.x <op> b.y` used to stop the parser with "expected value": only a
+ * literal was accepted on the right. */
+TEST(cypher_exec_where_property_vs_property_strings) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    /* Three CALLS edges, and every caller sits in a different file from its callee. */
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a:Function)-[:CALLS]->(b:Function) "
+                                "WHERE a.file_path <> b.file_path RETURN a.name, b.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 3);
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s,
+                            "MATCH (a:Function)-[:CALLS]->(b:Function) "
+                            "WHERE a.file_path = b.file_path RETURN a.name, b.name",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+
+    /* Both sides on the same variable. */
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE f.name = f.qualified_name RETURN f.name",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_where_property_vs_property_numbers) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    /* HandleOrder starts at 10, ValidateOrder at 5 and ends at 15; the other
+     * two functions carry no lines. Of the three CALLS edges, two have a
+     * caller that starts at or after its callee's last line. */
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a:Function)-[:CALLS]->(b:Function) "
+                                "WHERE a.start_line >= b.end_line RETURN a.name, b.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_FALSE(cypher_has_row_with(&r, "b.name", "ValidateOrder"));
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s,
+                            "MATCH (a:Function)-[:CALLS]->(b:Function) "
+                            "WHERE a.start_line < b.end_line RETURN a.name, b.name",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(cypher_get_col(&r, 0, "b.name"), "ValidateOrder");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The case that asked for this: values kept in the node's properties JSON,
+ * compared across a relationship and combined with literal conditions. */
+TEST(cypher_exec_where_property_vs_property_json_values) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t a1 = {.project = "test",
+                     .label = "File",
+                     .name = "AnimOne.cpp",
+                     .qualified_name = "test.AnimOne",
+                     .file_path = "Tools/Animation/AnimOne.cpp",
+                     .properties_json = "{\"toolset\":\"Animation\"}"};
+    cbm_node_t a2 = {.project = "test",
+                     .label = "File",
+                     .name = "AnimTwo.h",
+                     .qualified_name = "test.AnimTwo",
+                     .file_path = "Tools/Animation/AnimTwo.h",
+                     .properties_json = "{\"toolset\":\"Animation\"}"};
+    cbm_node_t b1 = {.project = "test",
+                     .label = "File",
+                     .name = "Blue.h",
+                     .qualified_name = "test.Blue",
+                     .file_path = "Tools/Blueprint/Blue.h",
+                     .properties_json = "{\"toolset\":\"Blueprint\"}"};
+    cbm_node_t c1 = {.project = "test",
+                     .label = "File",
+                     .name = "Core.h",
+                     .qualified_name = "test.Core",
+                     .file_path = "Core/Core.h"};
+    int64_t ia1 = cbm_store_upsert_node(s, &a1);
+    int64_t ia2 = cbm_store_upsert_node(s, &a2);
+    int64_t ib1 = cbm_store_upsert_node(s, &b1);
+    int64_t ic1 = cbm_store_upsert_node(s, &c1);
+    cbm_edge_t same = {.project = "test", .source_id = ia1, .target_id = ia2, .type = "IMPORTS"};
+    cbm_edge_t cross = {.project = "test", .source_id = ia1, .target_id = ib1, .type = "IMPORTS"};
+    cbm_edge_t core = {.project = "test", .source_id = ia1, .target_id = ic1, .type = "IMPORTS"};
+    cbm_store_insert_edge(s, &same);
+    cbm_store_insert_edge(s, &cross);
+    cbm_store_insert_edge(s, &core);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a:File)-[:IMPORTS]->(b:File) "
+                                "WHERE a.toolset <> b.toolset AND b.toolset <> '' "
+                                "RETURN a.name, b.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(cypher_get_col(&r, 0, "a.name"), "AnimOne.cpp");
+    ASSERT_STR_EQ(cypher_get_col(&r, 0, "b.name"), "Blue.h");
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s,
+                            "MATCH (a:File)-[:IMPORTS]->(b:File) "
+                            "WHERE a.toolset = b.toolset RETURN b.name",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(cypher_get_col(&r, 0, "b.name"), "AnimTwo.h");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A function call on the right is still not a value. */
+TEST(cypher_where_function_call_on_the_right_is_rejected) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a:Function)-[:CALLS]->(b:Function) "
+                                "WHERE a.name = toLower(b.name) RETURN a.name",
+                                "test", 0, &r);
+    ASSERT_NEQ(rc, 0);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(cypher) {
     /* Lexer */
     RUN_TEST(cypher_lex_simple_match);
@@ -4923,6 +5069,10 @@ SUITE(cypher) {
     RUN_TEST(cypher_issue252_tointeger);
     RUN_TEST(cypher_issue305_count_star_alias);
     RUN_TEST(cypher_exec_where_eq);
+    RUN_TEST(cypher_exec_where_property_vs_property_strings);
+    RUN_TEST(cypher_exec_where_property_vs_property_numbers);
+    RUN_TEST(cypher_exec_where_property_vs_property_json_values);
+    RUN_TEST(cypher_where_function_call_on_the_right_is_rejected);
     RUN_TEST(cypher_exec_unlabeled_where_beyond_result_limit_issue1196);
     RUN_TEST(cypher_exec_aggregate_sees_all_edges_beyond_expansion_cap_issue1196);
     RUN_TEST(cypher_exec_varlength_path_semantics_issue797);
