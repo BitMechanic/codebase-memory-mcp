@@ -232,6 +232,8 @@ typedef struct {
     bool is_abstract;
     bool is_test;
     bool is_entry_point;
+    bool
+        is_forward_declaration; // C-family class/struct/union specifier with no body; internal only
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
     /* Rust only: raw trait path from the exact `impl Trait for Type` block

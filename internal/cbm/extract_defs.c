@@ -4952,6 +4952,13 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
+    if ((ctx->language == CBM_LANG_C || ctx->language == CBM_LANG_CPP ||
+         ctx->language == CBM_LANG_CUDA) &&
+        (strcmp(kind, "class_specifier") == 0 || strcmp(kind, "struct_specifier") == 0 ||
+         strcmp(kind, "union_specifier") == 0)) {
+        def.is_forward_declaration =
+            ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("body")));
+    }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
 

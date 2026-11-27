@@ -2839,6 +2839,15 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                          * span, raw label is not a type: supersede
                                          * instead of dropping the correction. */
                                         CBMDefinition *r = &result->defs.items[j];
+                                        // A forward declaration does not supply
+                                        // the body recovered from an export macro.
+                                        // Keep both records; only real definitions
+                                        // compete for cross-file ownership.
+                                        if (r->is_forward_declaration &&
+                                            !d->is_forward_declaration && r->label && d->label &&
+                                            strcmp(r->label, d->label) == 0) {
+                                            continue;
+                                        }
                                         if (d->label && cbm_def_label_is_type(d->label) &&
                                             r->label && r->name && d->name &&
                                             strcmp(r->name, d->name) == 0 &&

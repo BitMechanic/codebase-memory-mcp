@@ -606,16 +606,17 @@ TEST(clsp_cross_file) {
  * the header/implementation owner-QN mismatch and dropped field metadata. */
 static int clsp_check_pointer_files(const char *header, const char *impl_path, const char *impl,
                                     const char *caller, const char *const *expected_callers,
-                                    int expected_count) {
-    const char *paths[] = {"Public/Thing.h", impl_path, "Private/Other.cpp"};
-    const char *sources[] = {header, impl, caller};
+                                    int expected_count, const char *extra_header) {
+    const char *paths[] = {"Public/Thing.h", impl_path, "Private/Other.cpp", "Public/Helper.h"};
+    const char *sources[] = {header, impl, caller, extra_header};
+    int file_count = extra_header ? 4 : 3;
     for (int shared = 0; shared < 2; shared++) {
-        CBMFileResult *results[3] = {0};
-        cbm_file_info_t files[3] = {0};
-        char *modules[3] = {0};
+        CBMFileResult *results[4] = {0};
+        cbm_file_info_t files[4] = {0};
+        char *modules[4] = {0};
         CBMArena arena;
         cbm_arena_init(&arena);
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < file_count; i++) {
             files[i].rel_path = (char *)paths[i];
             files[i].language = CBM_LANG_CPP;
             results[i] = cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_CPP, "mc",
@@ -623,20 +624,24 @@ static int clsp_check_pointer_files(const char *header, const char *impl_path, c
             ASSERT_NOT_NULL(results[i]);
         }
         int def_count = 0;
-        CBMLSPDef *defs = cbm_pxc_collect_all_defs(NULL, &arena, results, files, 3, "mc", modules,
-                                                   &def_count, NULL);
+        CBMLSPDef *defs = cbm_pxc_collect_all_defs(NULL, &arena, results, files, file_count, "mc",
+                                                   modules, &def_count, NULL);
         ASSERT_NOT_NULL(defs);
         CBMTypeRegistry *reg = shared ? cbm_c_build_cross_registry(&arena, defs, def_count) : NULL;
-        const char *includes[] = {"Thing.h"};
-        const char *include_qns[] = {"mc.Public.Thing"};
+        const char *includes[] = {"Helper.h", "Thing.h"};
+        const char *include_qns[] = {"mc.Public.Helper", "mc.Public.Thing"};
+        int include_start = extra_header ? 0 : 1;
+        int include_count = extra_header ? 2 : 1;
         for (int i = 1; i < 3; i++) {
             if (shared) {
                 cbm_run_c_lsp_cross_with_registry(&arena, sources[i], (int)strlen(sources[i]),
-                                                  modules[i], true, reg, includes, include_qns, 1,
-                                                  NULL, &results[i]->resolved_calls);
+                                                  modules[i], true, reg, includes + include_start,
+                                                  include_qns + include_start, include_count, NULL,
+                                                  &results[i]->resolved_calls);
             } else {
                 cbm_run_c_lsp_cross(&arena, sources[i], (int)strlen(sources[i]), modules[i], true,
-                                    defs, def_count, includes, include_qns, 1, NULL,
+                                    defs, def_count, includes + include_start,
+                                    include_qns + include_start, include_count, NULL,
                                     &results[i]->resolved_calls);
             }
         }
@@ -648,8 +653,15 @@ static int clsp_check_pointer_files(const char *header, const char *impl_path, c
                  * a resolver record exists under an unusable caller QN. */
                 for (int ci = 0; ci < results[i]->calls.count; ci++) {
                     CBMCall *call = &results[i]->calls.items[ci];
-                    if (!call->enclosing_func_qn ||
-                        !strstr(call->enclosing_func_qn, expected_callers[e]))
+                    if (!call->enclosing_func_qn)
+                        continue;
+                    size_t qn_len = strlen(call->enclosing_func_qn);
+                    size_t name_len = strlen(expected_callers[e]);
+                    if (qn_len < name_len ||
+                        strcmp(call->enclosing_func_qn + qn_len - name_len, expected_callers[e]) !=
+                            0 ||
+                        (qn_len > name_len &&
+                         call->enclosing_func_qn[qn_len - name_len - 1] != '.'))
                         continue;
                     const CBMResolvedCall *rc =
                         cbm_pipeline_find_lsp_resolution(&results[i]->resolved_calls, call, false);
@@ -675,7 +687,7 @@ static int clsp_check_pointer_files(const char *header, const char *impl_path, c
             }
         }
         free(defs);
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < file_count; i++) {
             free(modules[i]);
             cbm_free_result(results[i]);
         }
@@ -708,7 +720,7 @@ TEST(clsp_cross_file_pointer_owners) {
         for (int different_stem = 0; different_stem < 2; different_stem++) {
             ASSERT_EQ(clsp_check_pointer_files(
                           header, different_stem ? "Private/ThingModel.cpp" : "Private/Thing.cpp",
-                          impl, caller, expected, 5),
+                          impl, caller, expected, 5, NULL),
                       0);
         }
     }
@@ -735,7 +747,7 @@ TEST(clsp_cross_file_pointer_members) {
                               "ObjectGet", "SharedGet",    "WeakGet"};
     return clsp_check_pointer_files(header, "Private/ThingModel.cpp",
                                     "int UThing::FindModel(int X) const { return X; }\n", caller,
-                                    expected, 7);
+                                    expected, 7, NULL);
 }
 
 TEST(clsp_cross_file_pointer_returns) {
@@ -763,7 +775,72 @@ TEST(clsp_cross_file_pointer_returns) {
     const char *expected[] = {"AutoFree",       "AutoReturn",    "Chain",
                               "AutoTemplate",   "ChainTemplate", "SharedParam",
                               "SharedParamGet", "WeakLocal",     "ObjectLocal"};
-    return clsp_check_pointer_files(header, "Private/ThingModel.cpp", impl, caller, expected, 9);
+    return clsp_check_pointer_files(header, "Private/ThingModel.cpp", impl, caller, expected, 9,
+                                    NULL);
+}
+
+TEST(clsp_cross_file_forward_declarations) {
+    const char *expected[] = {"UThing.Resolve", "AOther.Go", "FreeCaller"};
+    for (int macro = 0; macro < 2; macro++) {
+        // The one-line struct is a real owner, just like the reflected class.
+        const char *header =
+            macro ? "UCLASS()\nclass MOD_API UThing { GENERATED_BODY()\npublic:\n"
+                    "int FindModel(int X) const; int Resolve(); };\n"
+                  : "struct UThing { int FindModel(int X) const; int Resolve(); };\n";
+        for (int location = 0; location < 4; location++) {
+            char impl[512], caller[512];
+            snprintf(impl, sizeof(impl),
+                     "%s#include \"Thing.h\"\n"
+                     "int UThing::FindModel(int X) const { return X; }\n"
+                     "int UThing::Resolve() { UThing* Self = this; return Self->FindModel(2); }\n",
+                     location == 2 ? "class UThing;\n" : "");
+            snprintf(caller, sizeof(caller),
+                     "%s#include \"Thing.h\"\n"
+                     "class AOther { public: int Go(); };\n"
+                     "int AOther::Go() { UThing* P = nullptr; return P->FindModel(1); }\n"
+                     "int FreeCaller(UThing* P) { return P->FindModel(3); }\n",
+                     location == 0   ? "#include \"Helper.h\"\n"
+                     : location == 1 ? "struct UThing;\n"
+                                     : "");
+            char same_file[512];
+            snprintf(same_file, sizeof(same_file), "class UThing;\n%s\nclass UThing;\n", header);
+            ASSERT_EQ(
+                clsp_check_pointer_files(
+                    location == 3 ? same_file : header, "Private/ThingModel.cpp", impl, caller,
+                    expected, 3,
+                    location == 0 ? "class UThing; class AHelper { UThing* Get(); };\n" : NULL),
+                0);
+        }
+    }
+    PASS();
+}
+
+TEST(clsp_forward_declaration_body_signal) {
+    CBMFileResult *r = extract_cpp("class ForwardClass;\nstruct ForwardStruct;\n"
+                                   "class\nMultilineForward;\n"
+                                   "struct FPair { int A; };\nclass Empty {};\n");
+    ASSERT_NOT_NULL(r);
+    for (int compact = 0; compact < 2; compact++) {
+        int declarations = 0, definitions = 0;
+        for (int i = 0; i < r->defs.count; i++) {
+            const CBMDefinition *d = &r->defs.items[i];
+            if (!d->label || strcmp(d->label, "Class") != 0)
+                continue;
+            if (strstr(d->name, "Forward")) {
+                ASSERT_TRUE(d->is_forward_declaration);
+                declarations++;
+            } else {
+                ASSERT_FALSE(d->is_forward_declaration);
+                ASSERT_EQ(d->start_line, d->end_line);
+                definitions++;
+            }
+        }
+        ASSERT_EQ(declarations, 3);
+        ASSERT_EQ(definitions, 2);
+        cbm_result_compact(r);
+    }
+    cbm_free_result(r);
+    PASS();
 }
 
 TEST(clsp_cross_file_pointer_owner_identity) {
@@ -807,6 +884,12 @@ TEST(clsp_cross_file_pointer_owner_identity) {
                          .label = "Class",
                          .def_module_qn = "p.b",
                          .lang = CBM_LANG_CPP},
+                        {.qualified_name = "p.caller.Duplicate",
+                         .short_name = "Duplicate",
+                         .label = "Class",
+                         .def_module_qn = "p.caller",
+                         .is_forward_declaration = true,
+                         .lang = CBM_LANG_CPP},
                         {.qualified_name = "p.impl.Duplicate.Run",
                          .short_name = "Run",
                          .label = "Method",
@@ -824,14 +907,27 @@ TEST(clsp_cross_file_pointer_owner_identity) {
     ASSERT_NOT_NULL(cbm_registry_lookup_method(reg, "p.header.One.Thing", "Next"));
     ASSERT_NULL(cbm_registry_lookup_method(reg, "p.a.Duplicate", "Run"));
     ASSERT_NULL(cbm_registry_lookup_method(reg, "p.b.Duplicate", "Run"));
-    const char *src = "void caller(One::Thing* a, Two::Thing* b) { a->Run(); b->Run(); }";
+    const CBMRegisteredType *forward = cbm_registry_lookup_type(reg, "p.caller.Duplicate");
+    ASSERT_NOT_NULL(forward);
+    ASSERT_NULL(forward->alias_of);
+    const char *src = "void caller(One::Thing* a, Two::Thing* b, Duplicate* d) {\n"
+                      "a->Run(); b->Run(); d->Run(); }";
     const char *includes[] = {"header.h"};
     const char *qns[] = {"p.header"};
-    CBMFileResult result = {0};
-    cbm_run_c_lsp_cross_with_registry(&arena, src, (int)strlen(src), "p.caller", true, reg,
-                                      includes, qns, 1, NULL, &result.resolved_calls);
-    ASSERT_GTE(find_resolved(&result, "p.caller.caller", "p.impl.One.Thing.Run"), 0);
-    ASSERT_GTE(find_resolved(&result, "p.caller.caller", "p.impl.Two.Thing.Run"), 0);
+    for (int shared = 0; shared < 2; shared++) {
+        CBMFileResult result = {0};
+        if (shared) {
+            cbm_run_c_lsp_cross_with_registry(&arena, src, (int)strlen(src), "p.caller", true, reg,
+                                              includes, qns, 1, NULL, &result.resolved_calls);
+        } else {
+            cbm_run_c_lsp_cross(&arena, src, (int)strlen(src), "p.caller", true, defs,
+                                sizeof(defs) / sizeof(defs[0]), includes, qns, 1, NULL,
+                                &result.resolved_calls);
+        }
+        ASSERT_GTE(find_resolved(&result, "p.caller.caller", "p.impl.One.Thing.Run"), 0);
+        ASSERT_GTE(find_resolved(&result, "p.caller.caller", "p.impl.Two.Thing.Run"), 0);
+        ASSERT_EQ(find_resolved(&result, "p.caller.caller", "p.impl.Duplicate.Run"), -1);
+    }
     cbm_arena_destroy(&arena);
     PASS();
 }
@@ -16768,6 +16864,8 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_cross_file_pointer_owners);
     RUN_TEST(clsp_cross_file_pointer_members);
     RUN_TEST(clsp_cross_file_pointer_returns);
+    RUN_TEST(clsp_cross_file_forward_declarations);
+    RUN_TEST(clsp_forward_declaration_body_signal);
     RUN_TEST(clsp_cross_file_pointer_owner_identity);
     RUN_TEST(clsp_pointer_member_shadow);
     RUN_TEST(clsp_cpp_macro_field_provenance);

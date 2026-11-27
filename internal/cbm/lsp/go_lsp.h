@@ -87,6 +87,7 @@ typedef struct {
     const char **signature_param_types; // borrowed ordered parameter type texts; "?" means unknown
     int signature_param_count;          // number of positional entries above
     bool is_interface;
+    bool is_forward_declaration; // C-family source specifier has no body
     CBMLanguage lang;           // language of the file that defined this — used by Tier 2 per-language registry build to filter all_defs
     const char* namespace_name; // declared namespace/package for source-root-independent JVM filtering
     /* Rust-only raw trait spelling.  The Rust registry canonicalizes this

@@ -1026,7 +1026,7 @@ static const CBMType *c_resolve_name_to_type(CLSPContext *ctx, const char *name)
         if (!ctx->include_ns_qns[i])
             continue;
         const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->include_ns_qns[i], name);
-        const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
+        const CBMRegisteredType *rt = cbm_registry_resolve_alias(ctx->registry, qn);
         if (rt) {
             if (included && strcmp(included->qualified_name, rt->qualified_name) != 0)
                 return cbm_type_unknown();
@@ -5994,12 +5994,14 @@ static const char *c_cross_source_name(const char *qn, const char *module) {
 static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const char *module_qn,
                                 CBMLSPDef *defs, int def_count, bool filter_languages) {
     // Index source-scoped owners once, before methods, independent of file
-    // order. A duplicate declaration name is deliberately not guessed.
+    // order. Forward declarations do not compete with definitions; multiple
+    // definitions of the same source-scoped name are deliberately not guessed.
     CBMHashTable *owners = cbm_ht_create(0);
     CBMLSPDef ambiguous = {0};
     for (int i = 0; i < def_count; i++) {
         CBMLSPDef *d = &defs[i];
-        if ((filter_languages && !c_cross_def_language(d)) || !c_cross_def_is_type(d))
+        if ((filter_languages && !c_cross_def_language(d)) || !c_cross_def_is_type(d) ||
+            d->is_forward_declaration)
             continue;
         const char *name = c_cross_source_name(d->qualified_name, d->def_module_qn);
         if (!name || !owners)
@@ -6024,6 +6026,17 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
             rt.qualified_name = d->qualified_name; /* borrowed — d outlives this call */
             rt.short_name = d->short_name;
             rt.is_interface = d->is_interface;
+            if (d->is_forward_declaration) {
+                const char *name = c_cross_source_name(d->qualified_name, d->def_module_qn);
+                const CBMLSPDef *owner = name && owners ? cbm_ht_get(owners, name) : NULL;
+                if (owner && owner->qualified_name) {
+                    // A declaration and definition in the same file have the
+                    // same QN: retain the definition's fields and avoid a cycle.
+                    if (strcmp(d->qualified_name, owner->qualified_name) == 0)
+                        continue;
+                    rt.alias_of = owner->qualified_name;
+                }
+            }
 
             // Embedded/base types
             if (d->embedded_types) {

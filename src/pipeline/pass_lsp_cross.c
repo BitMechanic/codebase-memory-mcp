@@ -410,6 +410,7 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     dst->def_module_qn = module_qn;
     dst->namespace_name = namespace_name ? cbm_arena_strdup(arena, namespace_name) : NULL;
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
+    dst->is_forward_declaration = src->is_forward_declaration;
     /* Single return-type string. The per-language registrars split on '|'
      * for multi-return languages (Go); single-return languages just see one
      * piece, which is what's already stored. */
