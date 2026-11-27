@@ -1,6 +1,7 @@
 #include "c_lsp.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
+#include "../../../src/foundation/hash_table.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +40,9 @@ static bool is_smart_ptr(const char *name) {
     // Extract short name after last dot (or use full name)
     const char *short_name = strrchr(name, '.');
     short_name = short_name ? short_name + 1 : name;
+    if (strcmp(short_name, "TSharedPtr") == 0 || strcmp(short_name, "TWeakObjectPtr") == 0 ||
+        strcmp(short_name, "TObjectPtr") == 0)
+        return true;
     // Check if the short name is a smart pointer type AND the QN contains "std"
     if (strcmp(short_name, "unique_ptr") == 0 || strcmp(short_name, "shared_ptr") == 0 ||
         strcmp(short_name, "weak_ptr") == 0 || strcmp(short_name, "auto_ptr") == 0 ||
@@ -51,6 +55,12 @@ static bool is_smart_ptr(const char *name) {
 // --- Helper: get node text ---
 static char *c_node_text(CLSPContext *ctx, TSNode node) {
     return cbm_node_text(ctx->arena, node, ctx->source);
+}
+
+static char *c_member_name(CLSPContext *ctx, TSNode field) {
+    if (strcmp(ts_node_type(field), "template_method") == 0)
+        field = ts_node_child_by_field_name(field, "name", 4);
+    return ts_node_is_null(field) ? NULL : c_node_text(ctx, field);
 }
 
 // --- Initialization ---
@@ -1009,6 +1019,23 @@ static const CBMType *c_resolve_name_to_type(CLSPContext *ctx, const char *name)
             return cbm_type_named(ctx->arena, qn);
     }
 
+    // A declaration in an included header keeps that header's module QN.
+    // Do not manufacture a caller-file type when the include identifies it.
+    const CBMRegisteredType *included = NULL;
+    for (int i = 0; i < ctx->include_count; i++) {
+        if (!ctx->include_ns_qns[i])
+            continue;
+        const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->include_ns_qns[i], name);
+        const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
+        if (rt) {
+            if (included && strcmp(included->qualified_name, rt->qualified_name) != 0)
+                return cbm_type_unknown();
+            included = rt;
+        }
+    }
+    if (included)
+        return cbm_type_named(ctx->arena, included->qualified_name);
+
     // Try std:: prefix (very common)
     if (ctx->cpp_mode) {
         const char *std_qn = cbm_arena_sprintf(ctx->arena, "std.%s", name);
@@ -1154,6 +1181,10 @@ const CBMType *c_parse_type_node(CLSPContext *ctx, TSNode node) {
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
         if (rt)
             return cbm_type_named(ctx->arena, qn);
+        const CBMType *resolved = c_resolve_name_to_type(ctx, qn);
+        if (resolved->kind == CBM_TYPE_NAMED &&
+            cbm_registry_lookup_type(ctx->registry, resolved->data.named.qualified_name))
+            return resolved;
         return cbm_type_named(ctx->arena, qn);
     }
 
@@ -1510,6 +1541,14 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
         if (!cbm_type_is_unknown(t))
             return t;
 
+        // Unqualified data members use the same receiver as this->field.
+        // Lexical bindings above still take precedence over member names.
+        if (ctx->enclosing_class_qn && !cbm_scope_contains(ctx->current_scope, name)) {
+            t = c_lookup_field_type(ctx, ctx->enclosing_class_qn, name, 0);
+            if (t && !cbm_type_is_unknown(t))
+                return t;
+        }
+
         // Check if it's a registered function (before type check — functions
         // return FUNC type which lets call_expression extract return types)
         const char *fqn = c_resolve_name(ctx, name);
@@ -1545,7 +1584,7 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
         if (ts_node_is_null(arg_node) || ts_node_is_null(field_node))
             return cbm_type_unknown();
 
-        char *field_name = c_node_text(ctx, field_node);
+        char *field_name = c_member_name(ctx, field_node);
         if (!field_name)
             return cbm_type_unknown();
 
@@ -1582,8 +1621,33 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
 
         // Look up method
         const CBMRegisteredFunc *method = c_lookup_member(ctx, type_qn, field_name);
-        if (method && method->signature)
-            return method->signature;
+        if (method && method->signature) {
+            const CBMType *signature = method->signature;
+            if (strcmp(ts_node_type(field_node), "template_method") == 0) {
+                TSNode args = ts_node_child_by_field_name(field_node, "arguments", 9);
+                const CBMType *types[16] = {0};
+                uint32_t count = ts_node_named_child_count(args);
+                for (uint32_t i = 0; i < count && i < 15; i++)
+                    types[i] = c_parse_type_node(ctx, ts_node_named_child(args, i));
+                const char *fallback[] = {"T", "U", "V", "W", NULL};
+                signature = cbm_type_substitute(
+                    ctx->arena, signature,
+                    method->type_param_names ? method->type_param_names : fallback, types);
+            }
+            return signature;
+        }
+
+        // Known pointer wrappers expose their pointee through get()/Get().
+        // This supplies an expression type, not a synthetic CALLS target.
+        if (!is_arrow && base->kind == CBM_TYPE_TEMPLATE &&
+            is_smart_ptr(base->data.template_type.template_name) &&
+            base->data.template_type.arg_count > 0 &&
+            (strcmp(field_name, "Get") == 0 || strcmp(field_name, "get") == 0)) {
+            const CBMType **returns = cbm_arena_alloc(ctx->arena, 2 * sizeof(*returns));
+            returns[0] = cbm_type_pointer(ctx->arena, base->data.template_type.template_args[0]);
+            returns[1] = NULL;
+            return cbm_type_func(ctx->arena, NULL, NULL, returns);
+        }
 
         // Look up field
         const CBMType *field_type = c_lookup_field_type(ctx, type_qn, field_name, 0);
@@ -3957,7 +4021,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                 TSNode arg_node = ts_node_child_by_field_name(func_node, "argument", 8);
                 TSNode field_node = ts_node_child_by_field_name(func_node, "field", 5);
                 if (!ts_node_is_null(arg_node) && !ts_node_is_null(field_node)) {
-                    char *field_name = c_node_text(ctx, field_node);
+                    char *field_name = c_member_name(ctx, field_node);
                     if (field_name) {
                         const CBMType *obj_type = c_eval_expr_type(ctx, arg_node);
 
@@ -4890,6 +4954,21 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
         const char *scope = ctx->current_namespace ? ctx->current_namespace : ctx->module_qn;
         if (scope) {
             func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", scope, func_qn);
+        }
+    }
+    // An out-of-line method's graph QN belongs to this implementation file,
+    // while its receiver may have been bound to a declaration in a header.
+    // Keep those two identities separate (including for this/field lookup).
+    if (!saved_class_qn && strstr(func_name, "::")) {
+        const char *scope = ctx->current_namespace ? ctx->current_namespace : ctx->module_qn;
+        if (scope) {
+            const char *qn =
+                cbm_arena_sprintf(ctx->arena, "%s.%s", scope, c_build_qn(ctx, func_name));
+            const CBMRegisteredFunc *rf = cbm_registry_lookup_func(ctx->registry, qn);
+            if (rf) {
+                func_qn = rf->qualified_name;
+                ctx->enclosing_class_qn = rf->receiver_type;
+            }
         }
     }
     ctx->enclosing_func_qn = func_qn;
@@ -5894,15 +5973,52 @@ void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, i
  * Reads field/return/embedded info from the def strings (def-driven —
  * no per-file AST mutation), so the same defs always yield the same
  * registry entries regardless of which file is being processed. */
+static bool c_cross_def_language(const CBMLSPDef *d) {
+    return d->lang == CBM_LANG_C || d->lang == CBM_LANG_CPP || d->lang == CBM_LANG_CUDA;
+}
+
+static bool c_cross_def_is_type(const CBMLSPDef *d) {
+    return d->label && (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Struct") == 0 ||
+                        strcmp(d->label, "Type") == 0 || strcmp(d->label, "Interface") == 0);
+}
+
+/* Strip only the known file prefix, retaining namespaces and nested classes.
+ * Header and implementation filenames are not part of C++ type identity. */
+static const char *c_cross_source_name(const char *qn, const char *module) {
+    if (!qn || !module || !module[0])
+        return NULL;
+    size_t n = strlen(module);
+    return strncmp(qn, module, n) == 0 && qn[n] == '.' ? qn + n + 1 : NULL;
+}
+
 static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const char *module_qn,
-                                CBMLSPDef *defs, int def_count) {
+                                CBMLSPDef *defs, int def_count, bool filter_languages) {
+    // Index source-scoped owners once, before methods, independent of file
+    // order. A duplicate declaration name is deliberately not guessed.
+    CBMHashTable *owners = cbm_ht_create(0);
+    CBMLSPDef ambiguous = {0};
     for (int i = 0; i < def_count; i++) {
         CBMLSPDef *d = &defs[i];
+        if ((filter_languages && !c_cross_def_language(d)) || !c_cross_def_is_type(d))
+            continue;
+        const char *name = c_cross_source_name(d->qualified_name, d->def_module_qn);
+        if (!name || !owners)
+            continue;
+        const CBMLSPDef *prior = cbm_ht_get(owners, name);
+        cbm_ht_set(owners, name,
+                   prior && (!prior->qualified_name ||
+                             strcmp(prior->qualified_name, d->qualified_name) != 0)
+                       ? &ambiguous
+                       : d);
+    }
+    for (int i = 0; i < def_count; i++) {
+        CBMLSPDef *d = &defs[i];
+        if (filter_languages && !c_cross_def_language(d))
+            continue;
         if (!d->qualified_name || !d->short_name)
             continue;
 
-        if (d->label && (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Type") == 0 ||
-                         strcmp(d->label, "Interface") == 0)) {
+        if (c_cross_def_is_type(d)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name; /* borrowed — d outlives this call */
@@ -6020,11 +6136,16 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
 
             if (d->receiver_type) {
                 rf.receiver_type = d->receiver_type; /* borrowed */
+                const char *name = c_cross_source_name(d->receiver_type, d->def_module_qn);
+                const CBMLSPDef *owner = name && owners ? cbm_ht_get(owners, name) : NULL;
+                if (owner && owner->qualified_name)
+                    rf.receiver_type = owner->qualified_name;
             }
 
             cbm_registry_add_func(reg, rf);
         }
     }
+    cbm_ht_free(owners);
 }
 
 /* Tier 2: build a project-wide C/C++/CUDA registry ONCE from all defs.
@@ -6041,13 +6162,7 @@ CBMTypeRegistry *cbm_c_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, in
     cbm_registry_init(reg, arena);
     cbm_c_stdlib_register(reg, arena);
     cbm_cpp_stdlib_register(reg, arena);
-    for (int i = 0; i < def_count; i++) {
-        CBMLSPDef *d = &defs[i];
-        if (d->lang != CBM_LANG_C && d->lang != CBM_LANG_CPP && d->lang != CBM_LANG_CUDA) {
-            continue;
-        }
-        c_register_lsp_defs(arena, reg, "", d, 1);
-    }
+    c_register_lsp_defs(arena, reg, "", defs, def_count, true);
     cbm_registry_finalize(reg);
     cbm_registry_build_type_short_index(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
@@ -6110,7 +6225,7 @@ void cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, co
         cbm_cpp_stdlib_register(&reg, arena);
 
     // Register all defs (shared helper — def-driven)
-    c_register_lsp_defs(arena, &reg, module_qn, defs, def_count);
+    c_register_lsp_defs(arena, &reg, module_qn, defs, def_count, false);
 
     // Use cached tree if available, otherwise parse fresh
     TSParser *parser = NULL;

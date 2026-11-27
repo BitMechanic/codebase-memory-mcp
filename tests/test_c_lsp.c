@@ -27,6 +27,7 @@
 #include "lsp/go_lsp.h"
 #include "lsp/type_registry.h"
 #include "../src/pipeline/lsp_resolve.h"
+#include "../src/pipeline/pass_lsp_cross.h"
 #include "arena.h"
 #include "preprocessor.h"
 #include <stdio.h>
@@ -597,6 +598,278 @@ TEST(clsp_cross_file) {
                                    "}\n"
                                    "");
     ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Use the pipeline's real definition collector: hand-written cross defs hide
+ * the header/implementation owner-QN mismatch and dropped field metadata. */
+static int clsp_check_pointer_files(const char *header, const char *impl_path, const char *impl,
+                                    const char *caller, const char *const *expected_callers,
+                                    int expected_count) {
+    const char *paths[] = {"Public/Thing.h", impl_path, "Private/Other.cpp"};
+    const char *sources[] = {header, impl, caller};
+    for (int shared = 0; shared < 2; shared++) {
+        CBMFileResult *results[3] = {0};
+        cbm_file_info_t files[3] = {0};
+        char *modules[3] = {0};
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        for (int i = 0; i < 3; i++) {
+            files[i].rel_path = (char *)paths[i];
+            files[i].language = CBM_LANG_CPP;
+            results[i] = cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_CPP, "mc",
+                                          paths[i], 0, NULL, NULL);
+            ASSERT_NOT_NULL(results[i]);
+        }
+        int def_count = 0;
+        CBMLSPDef *defs = cbm_pxc_collect_all_defs(NULL, &arena, results, files, 3, "mc", modules,
+                                                   &def_count, NULL);
+        ASSERT_NOT_NULL(defs);
+        CBMTypeRegistry *reg = shared ? cbm_c_build_cross_registry(&arena, defs, def_count) : NULL;
+        const char *includes[] = {"Thing.h"};
+        const char *include_qns[] = {"mc.Public.Thing"};
+        for (int i = 1; i < 3; i++) {
+            if (shared) {
+                cbm_run_c_lsp_cross_with_registry(&arena, sources[i], (int)strlen(sources[i]),
+                                                  modules[i], true, reg, includes, include_qns, 1,
+                                                  NULL, &results[i]->resolved_calls);
+            } else {
+                cbm_run_c_lsp_cross(&arena, sources[i], (int)strlen(sources[i]), modules[i], true,
+                                    defs, def_count, includes, include_qns, 1, NULL,
+                                    &results[i]->resolved_calls);
+            }
+        }
+        int missing = 0;
+        for (int e = 0; e < expected_count; e++) {
+            bool found = false;
+            for (int i = 1; i < 3; i++) {
+                /* Assert the textual call joins the LSP result, not just that
+                 * a resolver record exists under an unusable caller QN. */
+                for (int ci = 0; ci < results[i]->calls.count; ci++) {
+                    CBMCall *call = &results[i]->calls.items[ci];
+                    if (!call->enclosing_func_qn ||
+                        !strstr(call->enclosing_func_qn, expected_callers[e]))
+                        continue;
+                    const CBMResolvedCall *rc =
+                        cbm_pipeline_find_lsp_resolution(&results[i]->resolved_calls, call, false);
+                    if (rc && rc->callee_qn && strstr(rc->callee_qn, "UThing.FindModel") &&
+                        rc->strategy && strncmp(rc->strategy, "lsp_", 4) == 0 &&
+                        strcmp(rc->strategy, "lsp_unresolved") != 0) {
+                        const char *expected_qn = strstr(impl_path, "ThingModel")
+                                                      ? "mc.Private.ThingModel.UThing.FindModel"
+                                                      : "mc.Private.Thing.UThing.FindModel";
+                        ASSERT_STR_EQ(rc->callee_qn, expected_qn);
+                        ASSERT_TRUE(strcmp(rc->strategy, "lsp_type_dispatch") == 0 ||
+                                    strcmp(rc->strategy, "lsp_base_dispatch") == 0 ||
+                                    strcmp(rc->strategy, "lsp_smart_ptr_dispatch") == 0);
+                        ASSERT_TRUE(rc->confidence >= 0.95f);
+                        found = true;
+                    }
+                }
+            }
+            if (!found) {
+                fprintf(stderr, "pointer regression (shared=%d): missing %s -> FindModel\n", shared,
+                        expected_callers[e]);
+                missing++;
+            }
+        }
+        free(defs);
+        for (int i = 0; i < 3; i++) {
+            free(modules[i]);
+            cbm_free_result(results[i]);
+        }
+        cbm_arena_destroy(&arena);
+        ASSERT_EQ(missing, 0);
+    }
+    PASS();
+}
+
+TEST(clsp_cross_file_pointer_owners) {
+    const char *impl = "#include \"Thing.h\"\n"
+                       "int UThing::FindModel(int X) const { return X; }\n"
+                       "int UThing::Resolve() { UThing* Self = this; return Self->FindModel(2); }\n"
+                       "int UThing::ExplicitThis() { return this->FindModel(4); }\n";
+    const char *caller =
+        "#include \"Thing.h\"\n"
+        "class AOther { public: int Go(); };\n"
+        "int AOther::Go() { UThing* Thing = nullptr; return Thing->FindModel(1); }\n"
+        "int FreeCaller(UThing* Param) { return Param->FindModel(3); }\n"
+        "int Conditional(bool B, UThing* P) {\n"
+        "  UThing* Thing = B ? P : nullptr; return Thing->FindModel(5); }\n";
+    const char *expected[] = {"UThing.Resolve", "UThing.ExplicitThis", "AOther.Go", "FreeCaller",
+                              "Conditional"};
+    for (int macro = 0; macro < 2; macro++) {
+        const char *header = macro ? "UCLASS()\nclass MOD_API UThing : public UObject {\n"
+                                     "GENERATED_BODY()\npublic: int FindModel(int X) const;\n"
+                                     "int Resolve(); int ExplicitThis(); };\n"
+                                   : "class UThing { public: int FindModel(int X) const;\n"
+                                     "int Resolve(); int ExplicitThis(); };\n";
+        for (int different_stem = 0; different_stem < 2; different_stem++) {
+            ASSERT_EQ(clsp_check_pointer_files(
+                          header, different_stem ? "Private/ThingModel.cpp" : "Private/Thing.cpp",
+                          impl, caller, expected, 5),
+                      0);
+        }
+    }
+    PASS();
+}
+
+TEST(clsp_cross_file_pointer_members) {
+    const char *header =
+        "class UThing { public: int FindModel(int X) const; };\n"
+        "UCLASS()\nclass MOD_API AOther {\n GENERATED_BODY()\npublic:\n"
+        " UThing* Raw;\n UPROPERTY()\n TObjectPtr<UThing> Object;\n"
+        " TSharedPtr<UThing> Shared; TWeakObjectPtr<UThing> Weak;\n"
+        " int RawMember(); int ObjectMember(); int SharedMember(); int WeakMember();\n"
+        " int ObjectGet(); int SharedGet(); int WeakGet(); };\n";
+    const char *caller = "#include \"Thing.h\"\n"
+                         "int AOther::RawMember() { return Raw->FindModel(1); }\n"
+                         "int AOther::ObjectMember() { return Object->FindModel(2); }\n"
+                         "int AOther::SharedMember() { return this->Shared->FindModel(3); }\n"
+                         "int AOther::WeakMember() { return Weak->FindModel(4); }\n"
+                         "int AOther::ObjectGet() { return Object.Get()->FindModel(5); }\n"
+                         "int AOther::SharedGet() { return Shared.Get()->FindModel(6); }\n"
+                         "int AOther::WeakGet() { return this->Weak.Get()->FindModel(7); }\n";
+    const char *expected[] = {"RawMember", "ObjectMember", "SharedMember", "WeakMember",
+                              "ObjectGet", "SharedGet",    "WeakGet"};
+    return clsp_check_pointer_files(header, "Private/ThingModel.cpp",
+                                    "int UThing::FindModel(int X) const { return X; }\n", caller,
+                                    expected, 7);
+}
+
+TEST(clsp_cross_file_pointer_returns) {
+    const char *header = "class UThing { public: int FindModel(int X) const; UThing* Next(); };\n"
+                         "class World { public: UThing* GetThing();\n"
+                         " template<class T> T* GetSubsystem(); };\n";
+    const char *impl = "#include \"Thing.h\"\n"
+                       "int UThing::FindModel(int X) const { return X; }\n"
+                       "UThing* UThing::Next() { return this; }\n"
+                       "UThing* World::GetThing() { return nullptr; }\n"
+                       "template<class T> T* World::GetSubsystem() { return nullptr; }\n";
+    const char *caller =
+        "#include \"Thing.h\"\n"
+        "UThing* MakeThing() { return nullptr; }\n"
+        "int AutoFree() { auto* P = MakeThing(); return P->FindModel(0); }\n"
+        "int AutoReturn(World* W) { auto* P = W->GetThing(); return P->FindModel(1); }\n"
+        "int Chain(UThing* P) { return P->Next()->FindModel(2); }\n"
+        "int AutoTemplate(World* W) { auto* P = W->GetSubsystem<UThing>();\n"
+        " return P->FindModel(3); }\n"
+        "int ChainTemplate(World* W) { return W->GetSubsystem<UThing>()->FindModel(4); }\n"
+        "int SharedParam(TSharedPtr<UThing> P) { return P->FindModel(5); }\n"
+        "int SharedParamGet(TSharedPtr<UThing> P) { return P.Get()->FindModel(6); }\n"
+        "int WeakLocal() { TWeakObjectPtr<UThing> P; return P.Get()->FindModel(7); }\n"
+        "int ObjectLocal() { TObjectPtr<UThing> P; return P->FindModel(8); }\n";
+    const char *expected[] = {"AutoFree",       "AutoReturn",    "Chain",
+                              "AutoTemplate",   "ChainTemplate", "SharedParam",
+                              "SharedParamGet", "WeakLocal",     "ObjectLocal"};
+    return clsp_check_pointer_files(header, "Private/ThingModel.cpp", impl, caller, expected, 9);
+}
+
+TEST(clsp_cross_file_pointer_owner_identity) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[] = {{.qualified_name = "p.impl.One.Thing.Run",
+                         .short_name = "Run",
+                         .label = "Method",
+                         .receiver_type = "p.impl.One.Thing",
+                         .def_module_qn = "p.impl",
+                         .lang = CBM_LANG_CPP},
+                        {.qualified_name = "p.other.One.Thing.Next",
+                         .short_name = "Next",
+                         .label = "Method",
+                         .receiver_type = "p.other.One.Thing",
+                         .def_module_qn = "p.other",
+                         .lang = CBM_LANG_CPP},
+                        {.qualified_name = "p.impl.Two.Thing.Run",
+                         .short_name = "Run",
+                         .label = "Method",
+                         .receiver_type = "p.impl.Two.Thing",
+                         .def_module_qn = "p.impl",
+                         .lang = CBM_LANG_CPP},
+                        {.qualified_name = "p.header.One.Thing",
+                         .short_name = "Thing",
+                         .label = "Class",
+                         .def_module_qn = "p.header",
+                         .lang = CBM_LANG_CPP},
+                        {.qualified_name = "p.header.Two.Thing",
+                         .short_name = "Thing",
+                         .label = "Class",
+                         .def_module_qn = "p.header",
+                         .lang = CBM_LANG_CPP},
+                        {.qualified_name = "p.a.Duplicate",
+                         .short_name = "Duplicate",
+                         .label = "Class",
+                         .def_module_qn = "p.a",
+                         .lang = CBM_LANG_CPP},
+                        {.qualified_name = "p.b.Duplicate",
+                         .short_name = "Duplicate",
+                         .label = "Class",
+                         .def_module_qn = "p.b",
+                         .lang = CBM_LANG_CPP},
+                        {.qualified_name = "p.impl.Duplicate.Run",
+                         .short_name = "Run",
+                         .label = "Method",
+                         .receiver_type = "p.impl.Duplicate",
+                         .def_module_qn = "p.impl",
+                         .lang = CBM_LANG_CPP}};
+    CBMTypeRegistry *reg = cbm_c_build_cross_registry(&arena, defs, sizeof(defs) / sizeof(defs[0]));
+    ASSERT_NOT_NULL(reg);
+    const CBMRegisteredFunc *one = cbm_registry_lookup_method(reg, "p.header.One.Thing", "Run");
+    const CBMRegisteredFunc *two = cbm_registry_lookup_method(reg, "p.header.Two.Thing", "Run");
+    ASSERT_NOT_NULL(one);
+    ASSERT_NOT_NULL(two);
+    ASSERT_STR_EQ(one->qualified_name, "p.impl.One.Thing.Run");
+    ASSERT_STR_EQ(two->qualified_name, "p.impl.Two.Thing.Run");
+    ASSERT_NOT_NULL(cbm_registry_lookup_method(reg, "p.header.One.Thing", "Next"));
+    ASSERT_NULL(cbm_registry_lookup_method(reg, "p.a.Duplicate", "Run"));
+    ASSERT_NULL(cbm_registry_lookup_method(reg, "p.b.Duplicate", "Run"));
+    const char *src = "void caller(One::Thing* a, Two::Thing* b) { a->Run(); b->Run(); }";
+    const char *includes[] = {"header.h"};
+    const char *qns[] = {"p.header"};
+    CBMFileResult result = {0};
+    cbm_run_c_lsp_cross_with_registry(&arena, src, (int)strlen(src), "p.caller", true, reg,
+                                      includes, qns, 1, NULL, &result.resolved_calls);
+    ASSERT_GTE(find_resolved(&result, "p.caller.caller", "p.impl.One.Thing.Run"), 0);
+    ASSERT_GTE(find_resolved(&result, "p.caller.caller", "p.impl.Two.Thing.Run"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(clsp_pointer_member_shadow) {
+    CBMFileResult *r =
+        extract_cpp("class Thing { public: int FindModel() { return 1; } };\n"
+                    "class Owner { public: Thing* P;\n"
+                    " int Member() { return P->FindModel(); }\n"
+                    " int Shadow() { auto P = missing->Create(); return P->FindModel(); } };\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved(r, "Owner.Member", "Thing.FindModel"), 0);
+    ASSERT_EQ(find_resolved(r, "Owner.Shadow", "Thing.FindModel"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(clsp_cpp_macro_field_provenance) {
+    CBMFileResult *r = extract_cpp("#define DECLARE_FIELD(T, N) T N;\n"
+                                   "UCLASS()\nclass MOD_API Owner {\n GENERATED_BODY()\npublic:\n"
+                                   " UPROPERTY()\n TObjectPtr<Thing> Literal;\n"
+                                   " DECLARE_FIELD(Thing*, Generated)\n};\n");
+    ASSERT_NOT_NULL(r);
+    bool literal = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->label || strcmp(d->label, "Field") != 0)
+            continue;
+        ASSERT_STR_NEQ(d->name, "Generated");
+        if (strcmp(d->name, "Literal") == 0) {
+            ASSERT_STR_EQ(d->parent_class, "test.main.Owner");
+            ASSERT_NOT_NULL(d->return_type);
+            ASSERT_NOT_NULL(strstr(d->return_type, "TObjectPtr"));
+            ASSERT_NOT_NULL(strstr(d->return_type, "Thing"));
+            literal = true;
+        }
+    }
+    ASSERT_TRUE(literal);
     cbm_free_result(r);
     PASS();
 }
@@ -16492,6 +16765,12 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_inheritance);
     RUN_TEST(clsp_operator_stream);
     RUN_TEST(clsp_cross_file);
+    RUN_TEST(clsp_cross_file_pointer_owners);
+    RUN_TEST(clsp_cross_file_pointer_members);
+    RUN_TEST(clsp_cross_file_pointer_returns);
+    RUN_TEST(clsp_cross_file_pointer_owner_identity);
+    RUN_TEST(clsp_pointer_member_shadow);
+    RUN_TEST(clsp_cpp_macro_field_provenance);
     RUN_TEST(clsp_nocrash_template_expression);
     RUN_TEST(clsp_nocrash_template_extra_call_args);
     RUN_TEST(clsp_nocrash_template_function_multi_param_nested_call);

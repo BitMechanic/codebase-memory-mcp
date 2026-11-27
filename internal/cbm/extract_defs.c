@@ -4067,8 +4067,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // is scoped to its class and whose parent_class links it back (matching the
     // class node QN computed the same way) so DEFINES_METHOD edges resolve.
     if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
-        strcmp(ts_node_type(node), "function_definition") == 0) {
-        char *scope_name = cbm_cpp_out_of_line_parent_class(a, node, ctx->source);
+        strcmp(ts_node_type(func_node), "function_definition") == 0) {
+        char *scope_name = cbm_cpp_out_of_line_parent_class(a, func_node, ctx->source);
         if (scope_name && scope_name[0]) {
             const char *class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, scope_name);
             def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);

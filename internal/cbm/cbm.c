@@ -1761,12 +1761,13 @@ static bool cbm_span_contains_callable_def(const char *src, int src_len, uint32_
     return false;
 }
 
-/* #1989: type-def counterpart of cbm_span_contains_callable_def. A rescued
- * class/struct/enum definition has its name followed by a base clause (':') or
- * a body ('{'), not a parameter list, so the callable validator would reject
- * every type def pulled from the expanded tree. */
-static bool cbm_span_contains_type_def(const char *src, int src_len, uint32_t start_line,
-                                       uint32_t end_line, const char *name) {
+/* Verify a named declaration on the original source. Types admit a base/body
+ * or template argument list; fields admit a terminator, initializer, array or
+ * bitfield. A name appearing only as a macro argument (followed by ')' or ',')
+ * is not sufficient to recover a generated declaration. */
+static bool cbm_span_contains_named_decl(const char *src, int src_len, uint32_t start_line,
+                                         uint32_t end_line, const char *name,
+                                         const char *following_tokens) {
     if (!src || src_len <= 0 || !name || !name[0] || start_line == 0 || end_line < start_line) {
         return false;
     }
@@ -1797,8 +1798,7 @@ static bool cbm_span_contains_type_def(const char *src, int src_len, uint32_t st
         while (open < span_end && isspace((unsigned char)src[open])) {
             open++;
         }
-        // Base clause (": public B"), body ("{"), or template args ("<...").
-        if (open < span_end && (src[open] == ':' || src[open] == '{' || src[open] == '<')) {
+        if (open < span_end && src[open] && strchr(following_tokens, src[open])) {
             return true;
         }
     }
@@ -2762,9 +2762,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                                 }
                                                 if (r->start_line <= d->end_line &&
                                                     d->start_line <= r->end_line &&
-                                                    cbm_span_contains_type_def(
+                                                    cbm_span_contains_named_decl(
                                                         source, source_len, d->start_line,
-                                                        d->end_line, d->name)) {
+                                                        d->end_line, d->name, ":{<")) {
                                                     adopt = true;
                                                     supersede_j = j;
                                                 }
@@ -2815,8 +2815,12 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                      (!cbm_span_contains_callable_def(source, source_len,
                                                                       d->start_line, d->end_line,
                                                                       d->name) &&
-                                      !cbm_span_contains_type_def(source, source_len, d->start_line,
-                                                                  d->end_line, d->name)))) {
+                                      !cbm_span_contains_named_decl(
+                                          source, source_len, d->start_line, d->end_line, d->name,
+                                          d->label && strcmp(d->label, "Field") == 0 &&
+                                                  d->parent_class
+                                              ? ";=[{:"
+                                              : ":{<")))) {
                                     adopt = false;
                                 }
                                 for (int j = 0; j < defs_before && adopt; j++) {
