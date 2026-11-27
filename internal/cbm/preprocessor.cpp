@@ -580,6 +580,71 @@ void cbm_unreal_marker_lines(const char *source, int source_len, unsigned char *
     (void)scan_unreal_marker_lines(source, source_len, line_flags, line_count, flag);
 }
 
+// ── Unreal brace-block macros ────────────────────────────────────────
+// `ON_SCOPE_EXIT { ... };` runs its braces when the scope ends. ScopeExit.h
+// (Runtime/Core/Public/Misc) defines it as `const auto ScopeGuard_<line> =
+// ::ScopeExitSupport::FScopeGuardSyntaxSupport() + [&]() -> void`, so the braces
+// are a lambda body. That header defines no other public macro: the two
+// UE_PRIVATE_SCOPE_EXIT_JOIN macros are its own helpers. Tree-sitter sees an
+// unknown name before '{', reads a braced initializer, and fails on the first
+// ';' inside the body. A multi-line body can cut the enclosing function short.
+//
+// The raw parse leaves the name out (see cbm_parser_skip_unreal_block_macros),
+// so it sees a nested block of the enclosing function. The second pass cannot
+// do this job: Unreal test files sit inside `#if WITH_DEV_AUTOMATION_TESTS`,
+// which it evaluates as false, so the whole body is gone before it parses.
+static const char *kUnrealBlockMacros[] = {"ON_SCOPE_EXIT", NULL};
+
+int cbm_unreal_block_macro_spans(const char *source, int source_len, uint32_t *starts,
+                                 uint32_t *ends, int max_spans) {
+    if (!source || source_len <= 0) {
+        return 0;
+    }
+    int found = 0;
+    int i = 0;
+    while (i < source_len) {
+        i = skip_non_code(source, source_len, i);
+        if (i >= source_len) {
+            break;
+        }
+        if (!is_identifier_start(source[i])) {
+            i++;
+            continue;
+        }
+        int start = i;
+        while (i < source_len && is_identifier_char(source[i])) {
+            i++;
+        }
+        int raw = raw_string_after_prefix(source, source_len, start, i);
+        if (raw < 0) {
+            return -1;
+        }
+        if (raw > 0) {
+            i = raw;
+            continue;
+        }
+        if (!name_in_table(kUnrealBlockMacros, source + start, (size_t)(i - start))) {
+            continue;
+        }
+        // Only an invocation: the name, then '{' after blanks or line breaks.
+        // `#define ON_SCOPE_EXIT const auto ...` is followed by `const`.
+        int next = i;
+        while (next < source_len && (source[next] == ' ' || source[next] == '\t' ||
+                                     source[next] == '\r' || source[next] == '\n')) {
+            next++;
+        }
+        if (next >= source_len || source[next] != '{') {
+            continue;
+        }
+        if (starts && ends && found < max_spans) {
+            starts[found] = (uint32_t)start;
+            ends[found] = (uint32_t)i;
+        }
+        found++;
+    }
+    return found;
+}
+
 // True when `defines` already holds a definition of `name`, object-like
 // ("NAME=...") or function-like ("NAME(...)=...").
 static bool define_is_provided(const std::list<std::string> &defines, const char *name) {

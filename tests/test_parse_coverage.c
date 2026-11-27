@@ -1667,6 +1667,192 @@ TEST(unreal_marker_lines_marks_nothing_when_the_scan_is_poisoned) {
     PASS();
 }
 
+/* ── Unreal brace-block macros: ON_SCOPE_EXIT { ... }; ────────────────────
+ * Each fixture is an automation test inside `#if WITH_DEV_AUTOMATION_TESTS`,
+ * as in a real Unreal test file. The second pass drops that branch, so only
+ * the raw parse can account for the block. Lines 1-10 and the three lines
+ * after the body are shared; the function closes on the line given. */
+#define UE_SCOPE_HEAD                                                           \
+    "#include \"Misc/AutomationTest.h\"\n"                              /* 1 */ \
+    "#include \"Misc/ScopeExit.h\"\n"                                   /* 2 */ \
+    "#if WITH_DEV_AUTOMATION_TESTS\n"                                   /* 3 */ \
+    "static void Destroy(int* P) {}\n"                                  /* 4 */ \
+    "static void Restore(int* P) {}\n"                                  /* 5 */ \
+    "static void After(int* P) {}\n"                                    /* 6 */ \
+    "IMPLEMENT_SIMPLE_AUTOMATION_TEST(FScopeTest, \"Proj.Scope\", 0)\n" /* 7 */ \
+    "bool FScopeTest::RunTest(const FString& Parameters)\n"             /* 8 */ \
+    "{\n"                                                               /* 9 */ \
+    "\tint* P = nullptr;\n"                                             /* 10 */
+#define UE_SCOPE_TAIL  \
+    "\tAfter(P);\n"    \
+    "\treturn true;\n" \
+    "}\n"              \
+    "#endif\n"
+
+typedef struct {
+    const char *shape;
+    const char *src;
+    int destroy_line; /* line of the Destroy(P) call inside the block */
+    int end_line;     /* line of RunTest's closing brace */
+} ue_scope_case_t;
+
+static const ue_scope_case_t UE_SCOPE_CASES[] = {
+    {"single statement", UE_SCOPE_HEAD "\tON_SCOPE_EXIT { Destroy(P); };\n" UE_SCOPE_TAIL, 11, 14},
+    {"several statements, brace on the next line",
+     UE_SCOPE_HEAD "\tON_SCOPE_EXIT\n"     /* 11 */
+                   "\t{\n"                 /* 12 */
+                   "\t\tRestore(P);\n"     /* 13 */
+                   "\t\tDestroy(P);\n"     /* 14 */
+                   "\t\tP = nullptr;\n"    /* 15 */
+                   "\t};\n" UE_SCOPE_TAIL, /* 16 */
+     14, 19},
+    {"holding a lambda",
+     UE_SCOPE_HEAD
+     "\tON_SCOPE_EXIT { auto Undo = [&]() { Restore(P); }; Undo(); Destroy(P); };\n" UE_SCOPE_TAIL,
+     11, 14},
+    {"followed on its line by more statements",
+     UE_SCOPE_HEAD "\tON_SCOPE_EXIT { Destroy(P); }; Restore(P);\n" UE_SCOPE_TAIL, 11, 14},
+};
+
+/* The call to `callee` made inside a function whose QN ends with `.fn`. */
+static const CBMCall *call_in(const CBMFileResult *r, const char *callee, const char *fn) {
+    size_t fl = strlen(fn);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        const char *q = c->enclosing_func_qn;
+        size_t ql = q ? strlen(q) : 0;
+        if (c->callee_name && strcmp(c->callee_name, callee) == 0 && ql > fl &&
+            q[ql - fl - 1] == '.' && strcmp(q + ql - fl, fn) == 0) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+static const CBMDefinition *def_named(const CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+TEST(cpp_unreal_scope_exit_blocks_parse_inside_the_test) {
+    for (size_t k = 0; k < sizeof(UE_SCOPE_CASES) / sizeof(UE_SCOPE_CASES[0]); k++) {
+        const ue_scope_case_t *tc = &UE_SCOPE_CASES[k];
+        CBMFileResult *r = do_extract(tc->src, CBM_LANG_CPP, "ScopeTests.cpp");
+        ASSERT_NOT_NULL(r);
+        if (r->parse_incomplete) {
+            printf("  shape '%s': still partial at %s\n", tc->shape,
+                   r->error_ranges ? r->error_ranges : "?");
+        }
+        /* 1. no coverage miss */
+        ASSERT_FALSE(r->parse_incomplete);
+        ASSERT_NULL(r->error_ranges);
+        /* 2. the call inside the block belongs to the enclosing test, on its
+         *    own line: no byte of the file moved */
+        const CBMCall *inside = call_in(r, "Destroy", "RunTest");
+        ASSERT_NOT_NULL(inside);
+        ASSERT_EQ(inside->start_line, tc->destroy_line);
+        /* 3. the test's other calls are still extracted, and the test is not
+         *    cut short at the block */
+        ASSERT_NOT_NULL(call_in(r, "After", "RunTest"));
+        const CBMDefinition *run = def_named(r, "RunTest");
+        ASSERT_NOT_NULL(run);
+        ASSERT_EQ((int)run->start_line, 8);
+        ASSERT_EQ((int)run->end_line, tc->end_line);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Control: a block macro the tool does not know, in the same position, stays
+ * flagged. It proves the shape raises the flag, so the green above is the
+ * name being handled and not the signal being lost. */
+TEST(cpp_unknown_block_macro_stays_partial) {
+    CBMFileResult *r = do_extract(UE_SCOPE_HEAD "\tHOUSE_SCOPE { Destroy(P); };\n" UE_SCOPE_TAIL,
+                                  CBM_LANG_CPP, "ScopeTests.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The scanner finds invocations only: not the macro's own #define, a comment,
+ * a string, or a longer name that ends the same way. */
+TEST(unreal_block_macro_spans_finds_only_invocations) {
+    static const char *src =
+        "#define ON_SCOPE_EXIT const auto G = S() + [&]() -> void\n" /* 1 definition */
+        "void F() {\n"                                               /* 2 */
+        "\tON_SCOPE_EXIT { A(); };\n"                                /* 3 invocation */
+        "\tON_SCOPE_EXIT\n"                                          /* 4 invocation, */
+        "\t{ B(); };\n"                                              /* 5 brace below */
+        "\t// ON_SCOPE_EXIT { C(); };\n"                             /* 6 comment */
+        "\tconst char *S = \"ON_SCOPE_EXIT { D(); };\";\n"           /* 7 string */
+        "\tMY_ON_SCOPE_EXIT { E(); };\n"                             /* 8 other name */
+        "}\n";
+    uint32_t starts[4] = {0};
+    uint32_t ends[4] = {0};
+    int len = (int)strlen(src);
+    ASSERT_EQ(cbm_unreal_block_macro_spans(src, len, NULL, NULL, 0), 2);
+    ASSERT_EQ(cbm_unreal_block_macro_spans(src, len, starts, ends, 4), 2);
+    ASSERT_TRUE(strncmp(src + starts[0], "ON_SCOPE_EXIT { A", 17) == 0);
+    ASSERT_EQ((int)(ends[0] - starts[0]), 13);
+    ASSERT_TRUE(strncmp(src + starts[1], "ON_SCOPE_EXIT\n\t{ B", 18) == 0);
+    ASSERT_EQ((int)(ends[1] - starts[1]), 13);
+    PASS();
+}
+
+/* As for the markers, a raw string the scanner cannot follow poisons it, and
+ * the parse is then left exactly as it was. */
+TEST(unreal_block_macro_spans_poisoned_scan_finds_nothing) {
+    static const char *src = "void F() { ON_SCOPE_EXIT { A(); }; }\n"
+                             "const char *k = R\"never closed\n";
+    ASSERT_EQ(cbm_unreal_block_macro_spans(src, (int)strlen(src), NULL, NULL, 0), -1);
+    PASS();
+}
+
+/* ── `= {}` default arguments ────────────────────────────────────────────
+ * The vendored grammar reads a braced default value as a compound literal
+ * with an invented, zero-width type name. Nothing else is missing, so the
+ * file is not partial. The control is a default value that really is broken. */
+static const char *CPP_BRACE_DEFAULTS =
+    "#include <vector>\n"                                                                   /* 1 */
+    "struct FRoom { int Id; };\n"                                                           /* 2 */
+    "static int Count(const std::vector<int>& Cells = {}, FRoom Room = {1})\n"              /* 3 */
+    "{\n"                                                                                   /* 4 */
+    "\treturn (int)Cells.size() + Room.Id;\n"                                               /* 5 */
+    "}\n"                                                                                   /* 6 */
+    "int Use()\n"                                                                           /* 7 */
+    "{\n"                                                                                   /* 8 */
+    "\tauto Cells = [&](int A, const std::vector<int>& B = {}) { return A + Count(B); };\n" /* 9 */
+    "\treturn Cells(1) + Count();\n"                                                        /* 10 */
+    "}\n";                                                                                  /* 11 */
+
+TEST(cpp_brace_default_arguments_are_not_partial) {
+    CBMFileResult *r = do_extract(CPP_BRACE_DEFAULTS, CBM_LANG_CPP, "Defaults.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_NULL(r->error_ranges);
+    ASSERT_TRUE(has_def(r, "Count"));
+    ASSERT_TRUE(has_def(r, "Use"));
+    ASSERT_NOT_NULL(call_in(r, "Count", "Use"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(cpp_broken_default_argument_stays_partial) {
+    CBMFileResult *r =
+        do_extract("int Bad(int X = ) { return X; }\n", CBM_LANG_CPP, "Defaults.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -1721,4 +1907,10 @@ SUITE(parse_coverage) {
     RUN_TEST(cpp_unknown_test_declaration_stays_partial);
     RUN_TEST(unreal_marker_lines_marks_only_lines_a_marker_fills);
     RUN_TEST(unreal_marker_lines_marks_nothing_when_the_scan_is_poisoned);
+    RUN_TEST(cpp_unreal_scope_exit_blocks_parse_inside_the_test);
+    RUN_TEST(cpp_unknown_block_macro_stays_partial);
+    RUN_TEST(unreal_block_macro_spans_finds_only_invocations);
+    RUN_TEST(unreal_block_macro_spans_poisoned_scan_finds_nothing);
+    RUN_TEST(cpp_brace_default_arguments_are_not_partial);
+    RUN_TEST(cpp_broken_default_argument_stays_partial);
 }

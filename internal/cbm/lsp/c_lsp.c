@@ -6017,6 +6017,7 @@ void cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int 
             return;
         const TSLanguage *ts_lang = cpp_mode ? tree_sitter_cpp() : tree_sitter_c();
         ts_parser_set_language(parser, ts_lang);
+        (void)cbm_parser_skip_unreal_block_macros(parser, source, (int)source_len);
         tree = ts_parser_parse_string(parser, NULL, source, source_len);
         ts_parser_delete(parser);
         owns_tree = true;
@@ -6067,6 +6068,7 @@ void cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, co
             return;
         const TSLanguage *ts_lang = cpp_mode ? tree_sitter_cpp() : tree_sitter_c();
         ts_parser_set_language(parser, ts_lang);
+        (void)cbm_parser_skip_unreal_block_macros(parser, source, (int)source_len);
         tree = ts_parser_parse_string(parser, NULL, source, source_len);
         ts_parser_delete(parser);
         owns_tree = true;

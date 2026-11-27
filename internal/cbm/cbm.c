@@ -774,6 +774,56 @@ void cbm_destroy_thread_parser(void) {
     cbm_ts_field_cache_release_thread();
 }
 
+/* Advance a tree-sitter point over the bytes [from, to) of `src`. */
+static TSPoint cbm_point_advance(TSPoint at, const char *src, uint32_t from, uint32_t to) {
+    for (uint32_t i = from; i < to; i++) {
+        if (src[i] == '\n') {
+            at.row++;
+            at.column = 0;
+        } else {
+            at.column++;
+        }
+    }
+    return at;
+}
+
+/* The kept ranges are the complement of the macro-name spans, the same shape
+ * as the SQL value-row exclusion (#1735). Tree-sitter copies the ranges, so
+ * the scratch arrays are freed before returning. */
+bool cbm_parser_skip_unreal_block_macros(TSParser *parser, const char *source, int source_len) {
+    int n = parser ? cbm_unreal_block_macro_spans(source, source_len, NULL, NULL, 0) : 0;
+    if (n <= 0) {
+        return false;
+    }
+    uint32_t *spans =
+        (uint32_t *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)n * 2u * sizeof(uint32_t));
+    TSRange *kept = (TSRange *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, ((size_t)n + 1u) * sizeof(TSRange));
+    bool set = false;
+    if (spans && kept &&
+        cbm_unreal_block_macro_spans(source, source_len, spans, spans + n, n) == n) {
+        uint32_t count = 0;
+        uint32_t from = 0;
+        TSPoint from_pt = {0, 0};
+        TSPoint at = {0, 0};
+        for (int s = 0; s <= n; s++) {
+            uint32_t to = s < n ? spans[s] : (uint32_t)source_len;
+            at = cbm_point_advance(at, source, from, to);
+            if (to > from) {
+                kept[count++] = (TSRange){from_pt, at, from, to};
+            }
+            if (s < n) {
+                at = cbm_point_advance(at, source, to, spans[n + s]);
+                from = spans[n + s];
+                from_pt = at;
+            }
+        }
+        set = count > 0 && ts_parser_set_included_ranges(parser, kept, count);
+    }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, spans);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, kept);
+    return set;
+}
+
 void cbm_shutdown(void) {
     // Clean up thread-local parser for the calling thread.
     // Note: other threads' TLS parsers are freed when those threads exit.
@@ -1284,6 +1334,37 @@ static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_
     return true;
 }
 
+/* The vendored C++ grammar accepts only an expression as a parameter's default
+ * value, so `const TArray<int32>& Cells = {}` (or `= {1, 2}`) has no rule of
+ * its own. The parser recovers by inventing a zero-width type name and reading
+ * the braces as the compound literal `T{...}`. Everything else parses as
+ * written: the parameter, its name and type, the braces and whatever is inside
+ * them. The invented name is the only MISSING node, and it was never in the
+ * source, so nothing is absent from the graph. Deliberately narrow: a MISSING
+ * type_identifier that types a compound literal whose value is an initializer
+ * list and which is itself the default value of a parameter. */
+static bool cbm_is_brace_default_type_miss(TSNode n) {
+    if (!ts_node_is_missing(n) || strcmp(ts_node_type(n), "type_identifier") != 0) {
+        return false;
+    }
+    TSNode literal = ts_node_parent(n);
+    if (ts_node_is_null(literal) ||
+        strcmp(ts_node_type(literal), "compound_literal_expression") != 0) {
+        return false;
+    }
+    TSNode value = ts_node_child_by_field_name(literal, "value", 5);
+    if (ts_node_is_null(value) || strcmp(ts_node_type(value), "initializer_list") != 0) {
+        return false;
+    }
+    TSNode param = ts_node_parent(literal);
+    if (ts_node_is_null(param) ||
+        strcmp(ts_node_type(param), "optional_parameter_declaration") != 0) {
+        return false;
+    }
+    TSNode default_value = ts_node_child_by_field_name(param, "default_value", 13);
+    return !ts_node_is_null(default_value) && ts_node_eq(default_value, literal);
+}
+
 /* Walks to the end even after the cap is full, so `dropped` is the real number
  * of ranges lost rather than a lower bound. This costs little: the walk never
  * descends into an ERROR subtree — it records the top-most node and moves on —
@@ -1296,6 +1377,9 @@ static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, const 
         if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
             if (cbm_is_eof_terminator_miss(c, source, source_len)) {
                 continue; /* absent final newline only — nothing was dropped */
+            }
+            if (cbm_is_brace_default_type_miss(c)) {
+                continue; /* `= {}` default argument — nothing was dropped */
             }
             cbm_error_regions_push(acc, c); /* top-most region; do not descend */
         } else if (ts_node_has_error(c)) {
@@ -2311,8 +2395,13 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     bool sql_ranged = language == CBM_LANG_SQL && cbm_sql_values_exclusion_on(rel_path) &&
                       cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
                       ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
+    /* Unreal brace-block macros are kept out the same way, for the same
+     * reason: a parse where `ON_SCOPE_EXIT { ... };` is a nested block. */
+    bool unreal_ranged =
+        (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) &&
+        cbm_parser_skip_unreal_block_macros(parser, source, source_len);
     TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, opts);
-    if (sql_ranged) {
+    if (sql_ranged || unreal_ranged) {
         (void)ts_parser_set_included_ranges(parser, NULL, 0);
     }
     cbm_sql_kept_ranges_free(&sql_kept);

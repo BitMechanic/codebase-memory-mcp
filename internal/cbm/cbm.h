@@ -825,6 +825,15 @@ void cbm_reset_thread_parser(void);
 // Destroy the thread-local parser. Call on worker thread exit.
 void cbm_destroy_thread_parser(void);
 
+// C/C++: set included ranges on `parser` that leave out the name of every
+// Unreal brace-block macro invocation (ON_SCOPE_EXIT, see
+// cbm_unreal_block_macro_spans), so `ON_SCOPE_EXIT { ... };` parses as a nested
+// block of the enclosing function. Every byte, line and column kept is the
+// source's own. Returns true when ranges were set; a caller that reuses the
+// parser clears them after the parse (ts_parser_set_included_ranges(p, NULL, 0)).
+// Every parse of raw C/C++ source goes through this, so all passes see one tree.
+bool cbm_parser_skip_unreal_block_macros(TSParser *parser, const char *source, int source_len);
+
 // This thread's reusable tree cursor, reset to `node`. Child walks run once per
 // visited node; a cursor per walk was a malloc + free of its stack each time
 // (49.8 M on the Go corpus, waste sanitizer 2026-09-17). Valid until the next

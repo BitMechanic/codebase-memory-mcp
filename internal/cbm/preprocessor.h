@@ -46,6 +46,14 @@ int cbm_unreal_reflection_macro_count(const char *source, int source_len);
 void cbm_unreal_marker_lines(const char *source, int source_len, unsigned char *line_flags,
                              unsigned int line_count, unsigned char flag);
 
+// Byte spans [starts[k], ends[k]) of the names of Unreal brace-block macros
+// (ON_SCOPE_EXIT) invoked in the source: the name followed, after blanks or
+// line breaks, by '{'. Comments and string literals are skipped. Fills at most
+// max_spans pairs (starts/ends may be NULL to count only) and returns the total
+// found, or -1 when the scan cannot be trusted (an unrecognizable raw string).
+int cbm_unreal_block_macro_spans(const char *source, int source_len, uint32_t *starts,
+                                 uint32_t *ends, int max_spans);
+
 // Preprocess C/C++ source: expand macros, evaluate #ifdef, resolve #include.
 // Returns malloc-allocated expanded source, or NULL if no expansion needed/on failure.
 // extra_defines: NULL-terminated array of "NAME=VALUE" strings (can be NULL).
