@@ -376,6 +376,65 @@ TEST(clsp_cmode) {
     PASS();
 }
 
+/* Functions inside preprocessor conditional blocks are walked like any other:
+ * calls between them resolve through the LSP with their own caller. Every
+ * Unreal automation test sits inside `#if WITH_DEV_AUTOMATION_TESTS`. The
+ * second pass evaluates WITH_TESTS as false and drops the whole block, so
+ * every resolution below comes from the raw tree. */
+TEST(clsp_functions_inside_preproc_blocks_resolve) {
+    CBMFileResult *r = extract_cpp("#if WITH_TESTS\n"
+                                   "namespace N {\n"
+                                   "int helper(int x) { return x + 1; }\n"
+                                   "int user(int y) { return helper(y); }\n"
+                                   "}\n"
+                                   "using namespace N;\n"
+                                   "int outer() { return helper(1); }\n"
+                                   "#ifdef EXTRA\n"
+                                   "int in_ifdef() { return helper(2); }\n"
+                                   "#elif OTHER\n"
+                                   "int in_elif() { return helper(3); }\n"
+                                   "#else\n"
+                                   "int in_else() { return helper(4); }\n"
+                                   "#endif\n"
+                                   "#endif\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved(r, "user", "helper"), 0);
+    /* `using namespace N;` inside the block is read by the declaration pass */
+    ASSERT_GTE(find_resolved(r, "outer", "helper"), 0);
+    ASSERT_GTE(find_resolved(r, "in_ifdef", "helper"), 0);
+    ASSERT_GTE(find_resolved(r, "in_elif", "helper"), 0);
+    ASSERT_GTE(find_resolved(r, "in_else", "helper"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The same inside a class body: `#if WITH_EDITOR` around inline methods. */
+TEST(clsp_methods_inside_preproc_block_in_class_resolve) {
+    CBMFileResult *r = extract_cpp("int helper(int x) { return x; }\n"
+                                   "class C {\n"
+                                   "public:\n"
+                                   "#if WITH_EDITOR\n"
+                                   "    int edit() { return helper(1); }\n"
+                                   "#endif\n"
+                                   "};\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved(r, "edit", "helper"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A block's condition is not code: `#if FEATURE(2)` yields no call. */
+TEST(clsp_preproc_condition_is_not_a_call) {
+    CBMFileResult *r = extract_cpp("int FEATURE(int x) { return x; }\n"
+                                   "#if FEATURE(2)\n"
+                                   "int inside() { return 0; }\n"
+                                   "#endif\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "", "FEATURE"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(clsp_direct_call) {
     CBMFileResult *r = extract_c("\n"
                                  "int helper(int x) { return x + 1; }\n"
@@ -16420,6 +16479,9 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_scope_chain);
     RUN_TEST(clsp_static_cast);
     RUN_TEST(clsp_using_namespace);
+    RUN_TEST(clsp_functions_inside_preproc_blocks_resolve);
+    RUN_TEST(clsp_methods_inside_preproc_block_in_class_resolve);
+    RUN_TEST(clsp_preproc_condition_is_not_a_call);
     RUN_TEST(clsp_cmode);
     RUN_TEST(clsp_direct_call);
     RUN_TEST(clsp_direct_callcpp);

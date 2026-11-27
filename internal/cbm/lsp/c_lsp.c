@@ -4970,6 +4970,41 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
 // Process namespace
 // ============================================================================
 
+// A preprocessor conditional block (#if, #ifdef, #elif, #elifdef, #else) holds
+// declarations exactly as the scope around it does. The raw tree keeps every
+// branch, and the extractor's def walk already reads them all, so the walks
+// below treat a block's members as members of the enclosing scope. Before this
+// a function inside `#if ... #endif` was never processed as a function: its
+// calls had no enclosing function and fell back to textual matching. Every
+// Unreal automation test sits inside `#if WITH_DEV_AUTOMATION_TESTS`.
+static bool c_is_preproc_block(TSNode node) {
+    const char *k = ts_node_type(node);
+    return strcmp(k, "preproc_if") == 0 || strcmp(k, "preproc_ifdef") == 0 ||
+           strcmp(k, "preproc_elif") == 0 || strcmp(k, "preproc_elifdef") == 0 ||
+           strcmp(k, "preproc_else") == 0;
+}
+
+// The block's named children other than its condition (#if/#elif) or macro
+// name (#ifdef/#elifdef): this branch's declarations, then the next branch
+// (#elif/#else) as one more member, which the caller walks the same way.
+static TSNode *c_preproc_members(CLSPContext *ctx, TSNode block, uint32_t *count) {
+    TSNode condition = ts_node_child_by_field_name(block, "condition", 9);
+    TSNode name = ts_node_child_by_field_name(block, "name", 4);
+    uint32_t nc = ts_node_named_child_count(block);
+    TSNode *out = (TSNode *)cbm_arena_alloc(ctx->arena, (nc ? nc : 1) * sizeof(TSNode));
+    uint32_t n = 0;
+    for (uint32_t i = 0; out && i < nc; i++) {
+        TSNode c = ts_node_named_child(block, i);
+        if ((!ts_node_is_null(condition) && ts_node_eq(c, condition)) ||
+            (!ts_node_is_null(name) && ts_node_eq(c, name))) {
+            continue;
+        }
+        out[n++] = c;
+    }
+    *count = n;
+    return out;
+}
+
 // Process a top-level or nested declaration within a namespace/class body,
 // handling template_declaration wrapping.
 static void c_process_body_child(CLSPContext *ctx, TSNode child) {
@@ -4977,7 +5012,13 @@ static void c_process_body_child(CLSPContext *ctx, TSNode child) {
         return;
     const char *ck = ts_node_type(child);
 
-    if (strcmp(ck, "function_definition") == 0) {
+    if (c_is_preproc_block(child)) {
+        uint32_t mn = 0;
+        TSNode *members = c_preproc_members(ctx, child, &mn);
+        for (uint32_t i = 0; i < mn; i++) {
+            c_process_body_child(ctx, members[i]);
+        }
+    } else if (strcmp(ck, "function_definition") == 0) {
         c_process_function(ctx, child);
     } else if (strcmp(ck, "namespace_definition") == 0) {
         c_process_namespace(ctx, child);
@@ -5425,6 +5466,38 @@ static void c_process_class(CLSPContext *ctx, TSNode class_node) {
 // Process file: top-level walk
 // ============================================================================
 
+// Pass 1 for one file-scope item: using declarations, aliases and global
+// variables, read before any function body. A preprocessor block's members
+// count as file-scope items too (see c_is_preproc_block).
+static void c_process_file_decl(CLSPContext *ctx, TSNode child) {
+    const char *ck = ts_node_type(child);
+
+    if (c_is_preproc_block(child)) {
+        uint32_t mn = 0;
+        TSNode *members = c_preproc_members(ctx, child, &mn);
+        for (uint32_t i = 0; i < mn; i++) {
+            c_process_file_decl(ctx, members[i]);
+        }
+    } else if (strcmp(ck, "using_declaration") == 0 || strcmp(ck, "alias_declaration") == 0 ||
+               strcmp(ck, "type_definition") == 0 ||
+               strcmp(ck, "namespace_alias_definition") == 0) {
+        c_process_statement(ctx, child);
+    } else if (strcmp(ck, "declaration") == 0) {
+        c_process_statement(ctx, child);
+    } else if (strcmp(ck, "template_declaration") == 0) {
+        // template<class T> using Vec = std::vector<T>;
+        // Unwrap template_declaration to process inner alias/typedef
+        uint32_t tnc = ts_node_named_child_count(child);
+        for (uint32_t ti = 0; ti < tnc; ti++) {
+            TSNode inner = ts_node_named_child(child, ti);
+            const char *ik = ts_node_type(inner);
+            if (strcmp(ik, "alias_declaration") == 0 || strcmp(ik, "type_definition") == 0) {
+                c_process_statement(ctx, inner);
+            }
+        }
+    }
+}
+
 void c_lsp_process_file(CLSPContext *ctx, TSNode root) {
     if (ts_node_is_null(root))
         return;
@@ -5434,30 +5507,11 @@ void c_lsp_process_file(CLSPContext *ctx, TSNode root) {
     uint32_t kn = 0;
     TSNode *kids = cbm_lsp_collect_children(ctx->arena, root, &kn);
     TSNode child; // Hoisted: prevents ASan stack-use-after-scope between passes
-    TSNode inner;
 
     // Pass 1: process using declarations and global variables
     for (uint32_t i = 0; i < kn; i++) {
         child = kids[i];
-        const char *ck = ts_node_type(child);
-
-        if (strcmp(ck, "using_declaration") == 0 || strcmp(ck, "alias_declaration") == 0 ||
-            strcmp(ck, "type_definition") == 0 || strcmp(ck, "namespace_alias_definition") == 0) {
-            c_process_statement(ctx, child);
-        } else if (strcmp(ck, "declaration") == 0) {
-            c_process_statement(ctx, child);
-        } else if (strcmp(ck, "template_declaration") == 0) {
-            // template<class T> using Vec = std::vector<T>;
-            // Unwrap template_declaration to process inner alias/typedef
-            uint32_t tnc = ts_node_named_child_count(child);
-            for (uint32_t ti = 0; ti < tnc; ti++) {
-                inner = ts_node_named_child(child, ti);
-                const char *ik = ts_node_type(inner);
-                if (strcmp(ik, "alias_declaration") == 0 || strcmp(ik, "type_definition") == 0) {
-                    c_process_statement(ctx, inner);
-                }
-            }
-        }
+        c_process_file_decl(ctx, child);
     }
 
     // Pass 2: process functions, namespaces, classes, templates
