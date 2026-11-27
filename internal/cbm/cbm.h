@@ -834,6 +834,11 @@ void cbm_destroy_thread_parser(void);
 // Every parse of raw C/C++ source goes through this, so all passes see one tree.
 bool cbm_parser_skip_unreal_block_macros(TSParser *parser, const char *source, int source_len);
 
+// True for the one MISSING node the C++ grammar invents for a `= {}` (or
+// `= {1, 2}`) default argument: a zero-width type name that was never in the
+// source. Nothing is lost from the parse, so it is not a coverage miss.
+bool cbm_is_brace_default_type_miss(TSNode n);
+
 // This thread's reusable tree cursor, reset to `node`. Child walks run once per
 // visited node; a cursor per walk was a malloc + free of its stack each time
 // (49.8 M on the Go corpus, waste sanitizer 2026-09-17). Valid until the next

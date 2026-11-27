@@ -1343,7 +1343,9 @@ static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_
  * source, so nothing is absent from the graph. Deliberately narrow: a MISSING
  * type_identifier that types a compound literal whose value is an initializer
  * list and which is itself the default value of a parameter. */
-static bool cbm_is_brace_default_type_miss(TSNode n) {
+bool cbm_is_brace_default_type_miss(TSNode n) {
+    /* Uncached lookups: get_names_in_scope calls this from MCP request
+     * threads, which never release the thread-local field cache. */
     if (!ts_node_is_missing(n) || strcmp(ts_node_type(n), "type_identifier") != 0) {
         return false;
     }
@@ -1352,7 +1354,7 @@ static bool cbm_is_brace_default_type_miss(TSNode n) {
         strcmp(ts_node_type(literal), "compound_literal_expression") != 0) {
         return false;
     }
-    TSNode value = ts_node_child_by_field_name(literal, "value", 5);
+    TSNode value = (ts_node_child_by_field_name)(literal, "value", 5);
     if (ts_node_is_null(value) || strcmp(ts_node_type(value), "initializer_list") != 0) {
         return false;
     }
@@ -1361,7 +1363,7 @@ static bool cbm_is_brace_default_type_miss(TSNode n) {
         strcmp(ts_node_type(param), "optional_parameter_declaration") != 0) {
         return false;
     }
-    TSNode default_value = ts_node_child_by_field_name(param, "default_value", 13);
+    TSNode default_value = (ts_node_child_by_field_name)(param, "default_value", 13);
     return !ts_node_is_null(default_value) && ts_node_eq(default_value, literal);
 }
 

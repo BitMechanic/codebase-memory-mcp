@@ -57,6 +57,7 @@ enum {
 #include <sqlite3.h>
 #include "cypher/cypher.h"
 #include "discover/discover.h"
+#include "scope_names.h" /* get_names_in_scope */
 #include "pipeline/pipeline.h"
 #include "pipeline/pass_cross_repo.h"
 #include "git/git_context.h"
@@ -658,6 +659,14 @@ static const tool_def_t TOOLS[] = {
      "\"default\":\"tree\"}},\"additionalProperties\":false,"
      "\"required\":[\"project\",\"file_path\"]}"},
 
+    {"get_names_in_scope",
+     "C/C++ names in scope at a line, read from disk: params, locals, loop/catch vars, "
+     "lambda captures; flags shadowing and uncaptured names.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"file_path\":{\"type\":\"string\"},\"line\":{\"type\":\"integer\",\"minimum\":1},"
+     "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\"}},"
+     "\"additionalProperties\":false,\"required\":[\"project\",\"file_path\",\"line\"]}"},
+
     {"get_graph_schema",
      "Get node-label and edge-type counts. diagnostics=full also lists queryable properties.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
@@ -847,6 +856,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"trace_path", true, false, true, false},
     {"get_code_snippet", true, false, true, false},
     {"get_file_outline", true, false, true, false},
+    {"get_names_in_scope", true, false, true, false},
     {"get_graph_schema", true, false, true, false},
     {"compare_graphs", true, false, true, false},
     {"get_architecture", true, false, true, false},
@@ -912,10 +922,10 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) 
 
 static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     static const char *const analysis_tools[] = {
-        "search_graph",     "query_graph",      "trace_path",     "get_code_snippet",
-        "get_file_outline", "get_graph_schema", "compare_graphs", "get_architecture",
-        "search_code",      "list_projects",    "index_status",   "check_index_coverage",
-        "detect_changes",
+        "search_graph",     "query_graph",        "trace_path",     "get_code_snippet",
+        "get_file_outline", "get_graph_schema",   "compare_graphs", "get_architecture",
+        "search_code",      "list_projects",      "index_status",   "check_index_coverage",
+        "detect_changes",   "get_names_in_scope",
     };
     static const char *const scout_tools[] = {
         "search_graph",     "trace_path",    "get_code_snippet", "get_file_outline",
@@ -12827,6 +12837,237 @@ static char *handle_get_file_outline(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* ── get_names_in_scope ──────────────────────────────────────── */
+
+enum { MCP_SCOPE_FILE_MAX = 32 * 1024 * 1024 };
+
+/* The whole file, NUL-terminated, or NULL when it cannot be read or is larger
+ * than MCP_SCOPE_FILE_MAX. */
+static char *scope_read_file(const char *path, int *len) {
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return NULL;
+    }
+    cbm_sb_t sb;
+    cbm_sb_init(&sb);
+    char buf[64 * 1024];
+    size_t total = 0;
+    size_t n;
+    bool too_big = false;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        total += n;
+        if (total > (size_t)MCP_SCOPE_FILE_MAX) {
+            too_big = true;
+            break;
+        }
+        cbm_sb_append_n(&sb, buf, n);
+    }
+    bool failed = ferror(fp) != 0;
+    (void)fclose(fp);
+    char *text = cbm_sb_finish(&sb);
+    if (too_big || failed || !text) {
+        free(text);
+        return NULL;
+    }
+    *len = (int)total;
+    return text;
+}
+
+static char *scope_render(const char *file_path, int line, const cbm_scope_result_t *r,
+                          bool json_format) {
+    static const char *const cols[] = {"name",  "kind",         "type",   "line",
+                                       "depth", "shadows_line", "capture"};
+    if (!json_format) {
+        cbm_sb_t sb;
+        cbm_sb_init(&sb);
+        cbm_tree_scalar_str(&sb, "file_path", file_path);
+        cbm_tree_scalar_int(&sb, "line", line);
+        cbm_tree_scalar_str(&sb, "function", r->function);
+        cbm_tree_scalar_int(&sb, "function_line", r->function_line);
+        cbm_tree_scalar_bool(&sb, "parse_partial", r->parse_partial);
+        static const char *const lambda_cols[] = {"line", "captures"};
+        cbm_tree_table_header(&sb, "lambdas", r->lambda_count, lambda_cols, 2);
+        for (int i = 0; i < r->lambda_count; i++) {
+            cbm_tree_row_begin(&sb);
+            cbm_tree_cell_int(&sb, r->lambdas[i].line, true);
+            cbm_tree_cell_str(&sb, r->lambdas[i].captures, false);
+            cbm_tree_row_end(&sb);
+        }
+        cbm_tree_table_header(&sb, "names", r->count, cols, 7);
+        for (int i = 0; i < r->count; i++) {
+            const cbm_scope_name_t *n = &r->names[i];
+            cbm_tree_row_begin(&sb);
+            cbm_tree_cell_str(&sb, n->name, true);
+            cbm_tree_cell_str(&sb, n->kind, false);
+            cbm_tree_cell_str(&sb, n->type, false);
+            cbm_tree_cell_int(&sb, n->line, false);
+            cbm_tree_cell_int(&sb, n->depth, false);
+            if (n->shadows_line > 0) {
+                cbm_tree_cell_int(&sb, n->shadows_line, false);
+            } else {
+                cbm_tree_cell_str(&sb, "", false);
+            }
+            cbm_tree_cell_str(&sb, n->capture ? n->capture : "", false);
+            cbm_tree_row_end(&sb);
+        }
+        return cbm_sb_finish(&sb);
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *object = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, object);
+    yyjson_mut_obj_add_strcpy(doc, object, "file_path", file_path);
+    yyjson_mut_obj_add_int(doc, object, "line", line);
+    yyjson_mut_obj_add_strcpy(doc, object, "function", r->function);
+    yyjson_mut_obj_add_int(doc, object, "function_line", r->function_line);
+    yyjson_mut_obj_add_bool(doc, object, "parse_partial", r->parse_partial);
+    yyjson_mut_val *lambdas = yyjson_mut_arr(doc);
+    for (int i = 0; i < r->lambda_count; i++) {
+        yyjson_mut_val *l = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_int(doc, l, "line", r->lambdas[i].line);
+        yyjson_mut_obj_add_strcpy(doc, l, "captures", r->lambdas[i].captures);
+        yyjson_mut_arr_add_val(lambdas, l);
+    }
+    yyjson_mut_obj_add_val(doc, object, "lambdas", lambdas);
+    yyjson_mut_val *names = yyjson_mut_arr(doc);
+    for (int i = 0; i < r->count; i++) {
+        const cbm_scope_name_t *n = &r->names[i];
+        yyjson_mut_val *o = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, o, "name", n->name);
+        yyjson_mut_obj_add_str(doc, o, "kind", n->kind);
+        yyjson_mut_obj_add_strcpy(doc, o, "type", n->type);
+        yyjson_mut_obj_add_int(doc, o, "line", n->line);
+        yyjson_mut_obj_add_int(doc, o, "depth", n->depth);
+        if (n->shadows_line > 0) {
+            yyjson_mut_obj_add_int(doc, o, "shadows_line", n->shadows_line);
+        }
+        if (n->shadowed) {
+            yyjson_mut_obj_add_bool(doc, o, "shadowed", true);
+        }
+        if (n->capture) {
+            yyjson_mut_obj_add_strcpy(doc, o, "capture", n->capture);
+        }
+        yyjson_mut_arr_add_val(names, o);
+    }
+    yyjson_mut_obj_add_val(doc, object, "names", names);
+    char *payload = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return payload;
+}
+
+/* Reads the file as it is on disk now, so it answers for code being edited
+ * before any re-index. The project only supplies the root directory. */
+static char *handle_get_names_in_scope(cbm_mcp_server_t *srv, const char *args) {
+    const char *args_text = args ? args : "{}";
+    yyjson_doc *args_doc = yyjson_read(args_text, strlen(args_text), 0);
+    yyjson_val *root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result("get_names_in_scope arguments must be a JSON object", true);
+    }
+    const char *error = NULL;
+    yyjson_val *file_value = yyjson_obj_get(root, "file_path");
+    yyjson_val *line_value = yyjson_obj_get(root, "line");
+    yyjson_val *format_value = yyjson_obj_get(root, "format");
+    const char *file_path =
+        file_value && yyjson_is_str(file_value) ? yyjson_get_str(file_value) : NULL;
+    const char *format = format_value && yyjson_is_str(format_value) ? yyjson_get_str(format_value)
+                                                                     : (format_value ? "" : "tree");
+    char normalized_path[CBM_SZ_4K];
+    char *project = get_project_arg(args_text);
+    if (!project) {
+        error = "project is required";
+    } else if (!file_path || !file_path[0]) {
+        error = "file_path is required";
+    } else if (coverage_normalize_rel(file_path, false, normalized_path, sizeof(normalized_path)) !=
+               COVERAGE_PATH_OK) {
+        error = "file_path must be a repository-relative path without '..'";
+    } else if (!line_value || !yyjson_is_int(line_value) || yyjson_get_sint(line_value) < 1 ||
+               yyjson_get_sint(line_value) > INT_MAX) {
+        error = "line must be a positive integer";
+    } else if (strcmp(format, "tree") != 0 && strcmp(format, "json") != 0) {
+        error = "format must be either 'tree' or 'json'";
+    }
+    if (error) {
+        free(project);
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result(error, true);
+    }
+    int line = (int)yyjson_get_sint(line_value);
+    bool json_format = strcmp(format, "json") == 0;
+    yyjson_doc_free(args_doc);
+
+    CBMLanguage lang = cbm_language_for_filename(normalized_path);
+    if (lang != CBM_LANG_C && lang != CBM_LANG_CPP && lang != CBM_LANG_CUDA) {
+        free(project);
+        return cbm_mcp_text_result("get_names_in_scope reads C and C++ files only", true);
+    }
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
+        char *list = build_project_list_error("project not found or not indexed");
+        char *result = cbm_mcp_text_result(list, true);
+        free(list);
+        free(project);
+        return result;
+    }
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        return not_indexed;
+    }
+    char *root_path = project_root_from_store(store, project);
+    free(project);
+    if (!root_path || !root_path[0]) {
+        free(root_path);
+        return cbm_mcp_text_result("project root is unknown", true);
+    }
+    char abs_path[CBM_SZ_4K];
+    int written = snprintf(abs_path, sizeof(abs_path), "%s%s%s", root_path,
+                           root_path[strlen(root_path) - 1U] == '/' ? "" : "/", normalized_path);
+    /* Existence first, as coverage_path_freshness does: the containment check
+     * resolves the path, and a missing file is not an escape. */
+    cbm_path_info_t info;
+    bool exists = written > 0 && (size_t)written < sizeof(abs_path) &&
+                  cbm_path_info_utf8(abs_path, &info) == 0 && info.is_regular;
+    bool inside = exists && cbm_path_within_root(root_path, abs_path);
+    free(root_path);
+    if (!exists) {
+        return cbm_mcp_text_result("file_path does not exist under the project root", true);
+    }
+    if (!inside) {
+        return cbm_mcp_text_result("file_path resolves outside the project root", true);
+    }
+    int source_len = 0;
+    char *source = scope_read_file(abs_path, &source_len);
+    if (!source) {
+        return cbm_mcp_text_result("file_path could not be read (missing, unreadable or over "
+                                   "32 MiB)",
+                                   true);
+    }
+    /* A .h file may be either language; the C++ grammar reads C headers too. */
+    const char *ext = strrchr(normalized_path, '.');
+    bool cpp_mode = lang != CBM_LANG_C || (ext && strcmp(ext, ".h") == 0);
+    cbm_scope_result_t scope;
+    cbm_scope_status_t status = cbm_scope_names_at(source, source_len, cpp_mode, line, &scope);
+    free(source);
+    if (status == CBM_SCOPE_LINE_OUT_OF_RANGE) {
+        return cbm_mcp_text_result("line is past the end of the file", true);
+    }
+    if (status == CBM_SCOPE_NOT_IN_FUNCTION) {
+        return cbm_mcp_text_result("line is not inside a function body", true);
+    }
+    if (status != CBM_SCOPE_OK) {
+        return cbm_mcp_text_result("get_names_in_scope could not parse the file", true);
+    }
+    char *payload = scope_render(normalized_path, line, &scope, json_format);
+    cbm_scope_result_free(&scope);
+    if (!payload) {
+        return cbm_mcp_text_result("get_names_in_scope output allocation failed", true);
+    }
+    char *result = cbm_mcp_text_result(payload, false);
+    free(payload);
+    return result;
+}
+
 static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
     char *project = get_project_arg(args);
@@ -17938,6 +18179,9 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     }
     if (strcmp(tool_name, "get_file_outline") == 0) {
         return handle_get_file_outline(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_names_in_scope") == 0) {
+        return handle_get_names_in_scope(srv, args_json);
     }
     if (strcmp(tool_name, "search_code") == 0) {
         return handle_search_code(srv, args_json);

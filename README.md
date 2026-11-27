@@ -714,6 +714,7 @@ mode. `index_status` keeps describing the published graph and its freshness.
 | `compare_graphs` | Compare two indexed snapshots: node/edge additions and removals between a base and a target. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
 | `get_file_outline` | Declaration outline of one repository-relative file in source order, with optional label filter and paging. |
+| `get_names_in_scope` | C/C++ only: the names visible at the start of one line (parameters, locals, loop/condition/catch variables, lambda parameters and init-captures), innermost first, with shadowing and whether every enclosing lambda captures each one. Reads the file as it is on disk now, so it works on code being edited before a re-index. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records (`get` reads, `update` replaces the whole document, `set_sections` rewrites only the named sections and leaves every other byte untouched, `sections` lists headings). Query modes do not wait behind a same-project reindex; writes remain serialized. |

@@ -1361,8 +1361,10 @@ TEST(mcp_metadata_byte_budget) {
     ASSERT_NOT_NULL(json);
     /* 15 KiB covered the lean surface at the branch point; get_file_outline,
      * compare_graphs, manage_adr set_sections, and the search_code debug and
-     * list_projects include_details parameters landed on main since. */
-    ASSERT_LT((int)strlen(json), 18 * 1024);
+     * list_projects include_details parameters landed on main since. 19 KiB:
+     * get_names_in_scope (approved 2026-11-27), kept to a one-line description
+     * and an undocumented-field schema. */
+    ASSERT_LT((int)strlen(json), 19 * 1024);
 
     yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
     ASSERT_NOT_NULL(doc);
@@ -1404,6 +1406,8 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"trace_path", true, false, true, false},
         {"get_code_snippet", true, false, true, false},
         {"get_file_outline", true, false, true, false},
+        /* get_names_in_scope only reads one source file under the root. */
+        {"get_names_in_scope", true, false, true, false},
         {"get_graph_schema", true, false, true, false},
         {"compare_graphs", true, false, true, false},
         {"get_architecture", true, false, true, false},
@@ -2065,7 +2069,7 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
         "search_graph",     "query_graph",      "trace_path",     "get_code_snippet",
         "get_file_outline", "get_graph_schema", "compare_graphs", "get_architecture",
         "search_code",      "list_projects",    "index_status",   "check_index_coverage",
-        "detect_changes",
+        "detect_changes",   "get_names_in_scope",
     };
     ASSERT_EQ(mcp_response_tool_count(resp), sizeof(analysis_tools) / sizeof(analysis_tools[0]));
     for (size_t i = 0U; i < sizeof(analysis_tools) / sizeof(analysis_tools[0]); i++) {
@@ -3031,6 +3035,104 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
     ASSERT_NULL(strstr(inner, "line_1999"));
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* get_names_in_scope reads the file on disk under the project root: the
+ * names at a line inside a lambda, how the lambda captures each, and the
+ * argument and path errors. */
+TEST(tool_get_names_in_scope_reads_the_file_on_disk) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scope_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char src_dir[512];
+    snprintf(src_dir, sizeof(src_dir), "%s/src", tmp);
+    cbm_mkdir(src_dir);
+    char src_path[600];
+    snprintf(src_path, sizeof(src_path), "%s/Scope.cpp", src_dir);
+    ASSERT_EQ(th_write_file(src_path, "#if WITH_TESTS\n"                   /* 1 */
+                                      "void Run(int Count)\n"              /* 2 */
+                                      "{\n"                                /* 3 */
+                                      "\tint Total = 0;\n"                 /* 4 */
+                                      "\tauto Add = [Total](int Step)\n"   /* 5 */
+                                      "\t{\n"                              /* 6 */
+                                      "\t\treturn Total + Step + Count;\n" /* 7 */
+                                      "\t};\n"                             /* 8 */
+                                      "}\n"                                /* 9 */
+                                      "#endif\n"),                         /* 10 */
+              0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "scope-project");
+    ASSERT_EQ(cbm_store_upsert_project(st, "scope-project", tmp), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "get_names_in_scope",
+        "{\"project\":\"scope-project\",\"file_path\":\"src/Scope.cpp\",\"line\":7}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "isError\":true"));
+    char *text = extract_text_content(resp);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "Run"));
+    ASSERT_NOT_NULL(strstr(text, "Step"));
+    ASSERT_NOT_NULL(strstr(text, "by value"));
+    ASSERT_NOT_NULL(strstr(text, "NOT CAPTURED by lambda at line 5"));
+    free(text);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "get_names_in_scope",
+                               "{\"project\":\"scope-project\",\"file_path\":\"src/Scope.cpp\","
+                               "\"line\":7,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    text = extract_text_content(resp);
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "function")), "Run");
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(root, "parse_partial")));
+    yyjson_val *names = yyjson_obj_get(root, "names");
+    ASSERT_EQ(yyjson_arr_size(names), 3U); /* Step, Total, Count */
+    yyjson_val *count = yyjson_arr_get(names, 2);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(count, "name")), "Count");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(count, "kind")), "parameter");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(count, "capture")),
+                  "NOT CAPTURED by lambda at line 5");
+    yyjson_doc_free(doc);
+    free(text);
+    free(resp);
+
+    static const struct {
+        const char *args;
+        const char *error;
+    } errors[] = {
+        {"{\"project\":\"scope-project\",\"file_path\":\"src/Scope.cpp\",\"line\":99}",
+         "past the end"},
+        {"{\"project\":\"scope-project\",\"file_path\":\"src/Scope.cpp\",\"line\":1}",
+         "not inside a function body"},
+        {"{\"project\":\"scope-project\",\"file_path\":\"src/Scope.cpp\"}",
+         "line must be a positive integer"},
+        {"{\"project\":\"scope-project\",\"file_path\":\"../Scope.cpp\",\"line\":7}",
+         "without '..'"},
+        {"{\"project\":\"scope-project\",\"file_path\":\"src/notes.py\",\"line\":1}",
+         "C and C++ files only"},
+        {"{\"project\":\"scope-project\",\"file_path\":\"src/Missing.cpp\",\"line\":1}",
+         "does not exist under the project root"},
+    };
+    for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); i++) {
+        resp = cbm_mcp_handle_tool(srv, "get_names_in_scope", errors[i].args);
+        ASSERT_NOT_NULL(resp);
+        if (!strstr(resp, errors[i].error)) {
+            printf("  case %zu expected '%s', got %s\n", i, errors[i].error, resp);
+        }
+        ASSERT_NOT_NULL(strstr(resp, errors[i].error));
+        ASSERT_NOT_NULL(strstr(resp, "isError"));
+        free(resp);
+    }
     cbm_mcp_server_free(srv);
     th_rmtree(tmp);
     PASS();
@@ -21116,6 +21218,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
+    RUN_TEST(tool_get_names_in_scope_reads_the_file_on_disk);
     RUN_TEST(tool_get_code_snippet_omits_over_budget_whole_line);
     RUN_TEST(tool_get_code_snippet_pages_outline_rows_to_exact_budget);
     RUN_TEST(tool_search_graph_includes_node_properties);
